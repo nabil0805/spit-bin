@@ -6,7 +6,7 @@ import io
 import os
 import sqlite3
 import hashlib
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, date, time
 from pandas.errors import EmptyDataError
 
 # =========================================================
@@ -17,8 +17,7 @@ st.set_page_config(page_title="SMT Spit Analytics (DB Mode)", layout="wide")
 DB_PATH = "smt_spit.db"
 REJECT_CODES = {2, 3, 4, 5, 7}
 
-# Filename example:
-# 20260106091251-IIN2-053-2.csv
+# Filename example: 20260106091251-IIN2-053-2.csv
 # YYYYMMDDHHMMSS-MACHINE(.ext)
 FILENAME_RE = re.compile(r"^(?P<dt>\d{14})-(?P<machine>.+?)(?:\.[A-Za-z0-9]+)?$")
 
@@ -26,20 +25,34 @@ FILENAME_RE = re.compile(r"^(?P<dt>\d{14})-(?P<machine>.+?)(?:\.[A-Za-z0-9]+)?$"
 # DB HELPERS
 # =========================================================
 def db_connect():
-    # check_same_thread False is safe for Streamlit single-process usage
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
 def db_init(conn: sqlite3.Connection):
+    # BOM version registry
     conn.execute("""
-    CREATE TABLE IF NOT EXISTS bom (
-        component TEXT PRIMARY KEY,
-        unit_cost REAL NOT NULL,
-        updated_at TEXT NOT NULL
+    CREATE TABLE IF NOT EXISTS bom_versions (
+        bom_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bom_name TEXT NOT NULL,
+        uploaded_at TEXT NOT NULL
     )
     """)
+    # BOM items per version
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS bom_items (
+        bom_id INTEGER NOT NULL,
+        component TEXT NOT NULL,
+        unit_cost REAL NOT NULL,
+        PRIMARY KEY (bom_id, component),
+        FOREIGN KEY(bom_id) REFERENCES bom_versions(bom_id) ON DELETE CASCADE
+    )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bom_items_component ON bom_items(component)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bom_items_bomid ON bom_items(bom_id)")
+
+    # Logs + Events
     conn.execute("""
     CREATE TABLE IF NOT EXISTS logs (
         file_hash TEXT PRIMARY KEY,
@@ -67,6 +80,7 @@ def db_init(conn: sqlite3.Connection):
         FOREIGN KEY(file_hash) REFERENCES logs(file_hash) ON DELETE CASCADE
     )
     """)
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_dt ON events(file_dt)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_board ON events(board_name)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_mo ON events(mo)")
@@ -86,7 +100,7 @@ def parse_cost(v):
     if isinstance(v, (int, float, np.number)):
         return float(v)
     s = str(v).replace(",", "")
-    s = re.sub(r"[^\d\.\-]", "", s)  # strip currency symbols etc.
+    s = re.sub(r"[^\d\.\-]", "", s)
     try:
         return float(s)
     except:
@@ -99,10 +113,6 @@ def extract_component_from_bom_cell(text):
     return m.group(1).strip() if m else None
 
 def parse_dt_machine_from_filename(filename: str):
-    """
-    Returns (dt_iso, machine) from filename like:
-    20260106091251-IIN2-053-2.csv
-    """
     base = os.path.basename(filename)
     m = FILENAME_RE.match(base)
     if not m:
@@ -122,12 +132,6 @@ def safe_read_csv(bytes_data, **kwargs):
         return pd.read_csv(io.BytesIO(bytes_data), encoding="latin-1", **kwargs)
 
 def read_header_board_mo(file_bytes: bytes):
-    """
-    Reads row1 for:
-      Board Name: B1 (col 1)
-      MO: D1 (col 3)
-    (We rely on filename for dt + machine per your instruction.)
-    """
     try:
         try:
             header = pd.read_excel(io.BytesIO(file_bytes), nrows=1, header=None)
@@ -137,16 +141,13 @@ def read_header_board_mo(file_bytes: bytes):
         return None, None
 
     try:
-        board = str(header.iloc[0, 1]).strip()
-        mo = str(header.iloc[0, 3]).strip()
+        board = str(header.iloc[0, 1]).strip()  # B1
+        mo = str(header.iloc[0, 3]).strip()     # D1
         return board, mo
     except Exception:
         return None, None
 
 def read_body_df(file_bytes: bytes, filename: str):
-    """
-    Reads data skipping first 2 rows, keeping first 12 cols.
-    """
     ext = filename.lower().split(".")[-1]
     try:
         if ext in ("xls", "xlsx"):
@@ -167,11 +168,12 @@ def read_body_df(file_bytes: bytes, filename: str):
     return df
 
 # =========================================================
-# BOM INGEST (STORE IN DB)
+# BOM INGEST (VERSIONED)
 # =========================================================
-def ingest_bom(conn: sqlite3.Connection, bom_bytes: bytes):
+def ingest_bom(conn: sqlite3.Connection, bom_bytes: bytes, bom_name: str) -> int:
     xls = pd.ExcelFile(io.BytesIO(bom_bytes))
-    rows = []
+    items = []
+
     for sheet in xls.sheet_names:
         df = pd.read_excel(xls, sheet_name=sheet, header=None)
         for i in range(len(df)):
@@ -182,35 +184,79 @@ def ingest_bom(conn: sqlite3.Connection, bom_bytes: bytes):
             cost = parse_cost(raw_cost)
             if pd.isna(cost):
                 continue
-            rows.append((str(comp).strip(), float(cost)))
+            items.append((str(comp).strip(), float(cost)))
 
-    if not rows:
+    if not items:
         return 0
 
-    now = datetime.now().isoformat(sep=" ")
-    # Upsert into bom
+    uploaded_at = datetime.now().isoformat(sep=" ")
+    cur = conn.execute(
+        "INSERT INTO bom_versions(bom_name, uploaded_at) VALUES (?, ?)",
+        (bom_name, uploaded_at)
+    )
+    bom_id = cur.lastrowid
+
+    # Keep last cost per component within THIS upload
+    tmp = {}
+    for comp, cost in items:
+        tmp[comp] = cost
+
     conn.executemany(
-        """
-        INSERT INTO bom(component, unit_cost, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(component) DO UPDATE SET
-            unit_cost=excluded.unit_cost,
-            updated_at=excluded.updated_at
-        """,
-        [(c, cost, now) for c, cost in rows]
+        "INSERT INTO bom_items(bom_id, component, unit_cost) VALUES (?,?,?)",
+        [(bom_id, c, tmp[c]) for c in tmp.keys()]
     )
     conn.commit()
-    return len(set([r[0] for r in rows]))
+    return len(tmp)
 
-def get_bom_lookup(conn: sqlite3.Connection) -> dict:
-    cur = conn.execute("SELECT component, unit_cost FROM bom")
-    return {r[0]: float(r[1]) for r in cur.fetchall()}
+def list_boms(conn: sqlite3.Connection) -> pd.DataFrame:
+    return pd.read_sql_query(
+        "SELECT bom_id, bom_name, uploaded_at FROM bom_versions ORDER BY bom_id DESC",
+        conn
+    )
+
+def get_bom_lookup(conn: sqlite3.Connection, selected_bom_ids: list[int] | None) -> dict:
+    """
+    If selected_bom_ids is empty/None:
+      - Default behavior = latest cost per component across ALL BOMs
+    If selected_bom_ids provided:
+      - Use only those BOMs; if component appears multiple times, use newest bom_id inside that selection.
+    """
+    if not selected_bom_ids:
+        sql = """
+        SELECT bi.component, bi.unit_cost
+        FROM bom_items bi
+        JOIN (
+            SELECT component, MAX(bom_id) AS max_bom_id
+            FROM bom_items
+            GROUP BY component
+        ) latest
+        ON bi.component = latest.component AND bi.bom_id = latest.max_bom_id
+        """
+        rows = conn.execute(sql).fetchall()
+        return {r[0]: float(r[1]) for r in rows}
+
+    placeholders = ",".join(["?"] * len(selected_bom_ids))
+    sql = f"""
+    SELECT bi.component, bi.unit_cost
+    FROM bom_items bi
+    JOIN (
+        SELECT component, MAX(bom_id) AS max_bom_id
+        FROM bom_items
+        WHERE bom_id IN ({placeholders})
+        GROUP BY component
+    ) latest
+    ON bi.component = latest.component AND bi.bom_id = latest.max_bom_id
+    """
+    rows = conn.execute(sql, selected_bom_ids).fetchall()
+    return {r[0]: float(r[1]) for r in rows}
 
 # =========================================================
-# LOG INGEST (STORE IN DB)
+# LOG INGEST (EVENTS STORED)
 # =========================================================
 def ingest_logs(conn: sqlite3.Connection, uploads):
-    bom_lookup = get_bom_lookup(conn)
+    # At ingest time, we assign cost based on "default BOM behavior" (latest per component across all BOMs).
+    # Analysis-time can override costs by selecting BOM(s); we recompute costs then.
+    bom_lookup = get_bom_lookup(conn, selected_bom_ids=None)
 
     skipped = []
     inserted_files = 0
@@ -225,8 +271,6 @@ def ingest_logs(conn: sqlite3.Connection, uploads):
             continue
 
         file_hash = sha256_bytes(b)
-
-        # Already ingested?
         exists = conn.execute("SELECT 1 FROM logs WHERE file_hash=?", (file_hash,)).fetchone()
         if exists:
             skipped.append((filename, "Already ingested (same hash)"))
@@ -240,14 +284,12 @@ def ingest_logs(conn: sqlite3.Connection, uploads):
             skipped.append((filename, "No readable data after skiprows=2"))
             continue
 
-        # Insert log
         conn.execute(
             "INSERT INTO logs(file_hash, filename, file_dt, machine, board_name, mo, ingested_at) VALUES (?,?,?,?,?,?,?)",
             (file_hash, filename, dt_iso, machine, board, mo, datetime.now().isoformat(sep=" "))
         )
         inserted_files += 1
 
-        # Insert events
         ev_rows = []
         for _, r in df.iterrows():
             try:
@@ -275,16 +317,9 @@ def ingest_logs(conn: sqlite3.Connection, uploads):
     return inserted_files, inserted_events, skipped
 
 # =========================================================
-# QUERY (FILTERS)
+# FILTER SQL HELPERS
 # =========================================================
-def query_events(conn: sqlite3.Connection,
-                 dt_start: datetime | None,
-                 dt_end: datetime | None,
-                 boards: list[str],
-                 mos: list[str],
-                 machines: list[str],
-                 components: list[str]) -> pd.DataFrame:
-
+def _build_where(dt_start, dt_end, boards, mos, machines, components=None):
     where = []
     params = []
 
@@ -304,9 +339,25 @@ def query_events(conn: sqlite3.Connection,
     if machines:
         where.append("machine IN (%s)" % ",".join(["?"] * len(machines)))
         params.extend(machines)
-    if components:
+    if components is not None and components:
         where.append("component IN (%s)" % ",".join(["?"] * len(components)))
         params.extend(components)
+
+    return where, params
+
+# =========================================================
+# QUERY (FILTERS + BOM SELECTION)
+# =========================================================
+def query_events(conn: sqlite3.Connection,
+                 dt_start: datetime | None,
+                 dt_end: datetime | None,
+                 boards: list[str],
+                 mos: list[str],
+                 machines: list[str],
+                 components: list[str],
+                 bom_lookup: dict) -> pd.DataFrame:
+
+    where, params = _build_where(dt_start, dt_end, boards, mos, machines, components)
 
     sql = """
     SELECT
@@ -316,9 +367,7 @@ def query_events(conn: sqlite3.Connection,
       board_name AS Board,
       mo AS MO,
       file_dt AS FileDateTime,
-      machine AS Machine,
-      unit_cost AS UnitCost,
-      cost AS Cost
+      machine AS Machine
     FROM events
     """
     if where:
@@ -326,38 +375,42 @@ def query_events(conn: sqlite3.Connection,
     sql += " ORDER BY file_dt DESC"
 
     df = pd.read_sql_query(sql, conn, params=params)
+
+    # Recompute cost using the selected BOM(s) for THIS analysis run
+    if df.empty:
+        df["UnitCost"] = []
+        df["Cost"] = []
+        return df
+
+    df["UnitCost"] = df["Component"].map(lambda c: float(bom_lookup.get(str(c).strip(), 0.0)))
+    df["Cost"] = df["UnitCost"]
     return df
 
-def query_file_counts(conn: sqlite3.Connection,
-                      dt_start: datetime | None,
-                      dt_end: datetime | None,
-                      boards: list[str],
-                      mos: list[str],
-                      machines: list[str]) -> int:
-    where = []
-    params = []
-
-    if dt_start is not None:
-        where.append("(file_dt IS NOT NULL AND file_dt >= ?)")
-        params.append(dt_start.isoformat(sep=" "))
-    if dt_end is not None:
-        where.append("(file_dt IS NOT NULL AND file_dt <= ?)")
-        params.append(dt_end.isoformat(sep=" "))
-
-    if boards:
-        where.append("board_name IN (%s)" % ",".join(["?"] * len(boards)))
-        params.extend(boards)
-    if mos:
-        where.append("mo IN (%s)" % ",".join(["?"] * len(mos)))
-        params.extend(mos)
-    if machines:
-        where.append("machine IN (%s)" % ",".join(["?"] * len(machines)))
-        params.extend(machines)
-
+def query_total_boards(conn: sqlite3.Connection,
+                       dt_start: datetime | None,
+                       dt_end: datetime | None,
+                       boards: list[str],
+                       mos: list[str],
+                       machines: list[str]) -> int:
+    where, params = _build_where(dt_start, dt_end, boards, mos, machines, components=None)
     sql = "SELECT COUNT(*) FROM logs"
     if where:
         sql += " WHERE " + " AND ".join(where)
     return int(conn.execute(sql, params).fetchone()[0])
+
+def query_boards_run_by_board(conn: sqlite3.Connection,
+                              dt_start: datetime | None,
+                              dt_end: datetime | None,
+                              boards: list[str],
+                              mos: list[str],
+                              machines: list[str]) -> pd.DataFrame:
+    where, params = _build_where(dt_start, dt_end, boards, mos, machines, components=None)
+    sql = "SELECT board_name AS Board, COUNT(*) AS BoardsRun FROM logs"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " GROUP BY board_name"
+    df = pd.read_sql_query(sql, conn, params=params)
+    return df
 
 # =========================================================
 # DERIVED VIEWS
@@ -407,23 +460,49 @@ db_init(conn)
 
 st.title("SMT Spit Analytics (Database Mode)")
 
+# ---------- View uploaded files/BOMs ----------
+with st.expander("📚 View uploaded Logs and BOMs"):
+    cA, cB = st.columns(2)
+
+    with cA:
+        st.subheader("BOMs uploaded")
+        boms_df = list_boms(conn)
+        if boms_df.empty:
+            st.info("No BOMs stored yet.")
+        else:
+            st.dataframe(boms_df, use_container_width=True, height=240)
+
+    with cB:
+        st.subheader("Log files ingested (latest 200)")
+        logs_df = pd.read_sql_query(
+            "SELECT filename, file_dt, machine, board_name, mo, ingested_at FROM logs ORDER BY ingested_at DESC LIMIT 200",
+            conn
+        )
+        if logs_df.empty:
+            st.info("No logs ingested yet.")
+        else:
+            st.dataframe(logs_df, use_container_width=True, height=240)
+
 # ---------- Admin: BOM + Log ingest ----------
 with st.expander("📦 Data Store (upload once, reuse later)", expanded=True):
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("Upload / Update BOM")
+        st.subheader("Upload / Update BOM (stored as version)")
         bom_up = st.file_uploader("BOM Excel (all sheets read)", type=["xls", "xlsx"], key="bom_up")
+        bom_name = st.text_input("BOM name/label (e.g. BoardRevA, Jan-2026)", value="", key="bom_name")
         if st.button("Save BOM to Database", type="secondary"):
             if not bom_up:
                 st.warning("Upload a BOM file first.")
             else:
-                n = ingest_bom(conn, bom_up.getvalue())
-                st.success(f"BOM stored/updated. Components loaded: {n}")
+                label = bom_name.strip() if bom_name.strip() else bom_up.name
+                n = ingest_bom(conn, bom_up.getvalue(), label)
+                st.success(f"BOM stored as a new version. Components loaded: {n}")
 
     with col2:
         st.subheader("Ingest Log Files")
-        logs_up = st.file_uploader("Upload log files (CSV/XLS/XLSX)", type=["csv","xls","xlsx"], accept_multiple_files=True, key="logs_up")
+        logs_up = st.file_uploader("Upload log files (CSV/XLS/XLSX)", type=["csv","xls","xlsx"],
+                                   accept_multiple_files=True, key="logs_up")
         if st.button("Ingest Logs into Database", type="secondary"):
             if not logs_up:
                 st.warning("Upload log files first.")
@@ -436,7 +515,6 @@ with st.expander("📦 Data Store (upload once, reuse later)", expanded=True):
 # ---------- Filter panel ----------
 st.subheader("🔎 Filters (combine as needed)")
 
-# Default date/time range: today 00:00 to now
 today = date.today()
 default_start = datetime.combine(today, time(0, 0, 0))
 default_end = datetime.now()
@@ -459,13 +537,38 @@ with c4:
 dt_start = datetime.combine(start_date, start_time)
 dt_end = datetime.combine(end_date, end_time)
 
-# Populate filter options from DB (fast)
-boards_all = [r[0] for r in conn.execute("SELECT DISTINCT board_name FROM logs WHERE board_name IS NOT NULL AND board_name <> '' ORDER BY board_name").fetchall()]
-mos_all = [r[0] for r in conn.execute("SELECT DISTINCT mo FROM logs WHERE mo IS NOT NULL AND mo <> '' ORDER BY mo").fetchall()]
-machines_all = [r[0] for r in conn.execute("SELECT DISTINCT machine FROM logs WHERE machine IS NOT NULL AND machine <> '' ORDER BY machine").fetchall()]
-components_all = [r[0] for r in conn.execute("SELECT DISTINCT component FROM events WHERE component IS NOT NULL AND component <> '' ORDER BY component").fetchall()]
+# Options from DB
+boards_all = [r[0] for r in conn.execute(
+    "SELECT DISTINCT board_name FROM logs WHERE board_name IS NOT NULL AND board_name <> '' ORDER BY board_name"
+).fetchall()]
+mos_all = [r[0] for r in conn.execute(
+    "SELECT DISTINCT mo FROM logs WHERE mo IS NOT NULL AND mo <> '' ORDER BY mo"
+).fetchall()]
+machines_all = [r[0] for r in conn.execute(
+    "SELECT DISTINCT machine FROM logs WHERE machine IS NOT NULL AND machine <> '' ORDER BY machine"
+).fetchall()]
+components_all = [r[0] for r in conn.execute(
+    "SELECT DISTINCT component FROM events WHERE component IS NOT NULL AND component <> '' ORDER BY component"
+).fetchall()]
 
-f1, f2, f3, f4 = st.columns(4)
+# BOM selector options
+boms_df = list_boms(conn)
+bom_labels = []
+bom_id_by_label = {}
+if not boms_df.empty:
+    for _, r in boms_df.iterrows():
+        label = f'{int(r["bom_id"])} | {r["bom_name"]} | {r["uploaded_at"]}'
+        bom_labels.append(label)
+        bom_id_by_label[label] = int(r["bom_id"])
+
+f0, f1, f2, f3, f4 = st.columns([1.2, 1, 1, 1, 1])
+with f0:
+    selected_boms_labels = st.multiselect(
+        "BOM(s) to use for analysis (leave blank = default)",
+        options=bom_labels,
+        default=[],
+        key="selected_boms"
+    )
 with f1:
     boards_sel = st.multiselect("Board Name", boards_all, default=[], key="boards_sel")
 with f2:
@@ -475,16 +578,26 @@ with f3:
 with f4:
     components_sel = st.multiselect("Component (optional)", components_all, default=[], key="components_sel")
 
-# ---------- Keep results in session_state so dropdown works ----------
+selected_bom_ids = [bom_id_by_label[x] for x in selected_boms_labels] if selected_boms_labels else []
+
+# ---------- Persist results so dropdown works ----------
 if "has_results" not in st.session_state:
     st.session_state.has_results = False
 
 if run_query:
-    events_df = query_events(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel, components_sel)
-    boards_count = query_file_counts(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel)
+    bom_lookup = get_bom_lookup(conn, selected_bom_ids if selected_bom_ids else None)
+
+    events_df = query_events(
+        conn, dt_start, dt_end,
+        boards_sel, mos_sel, machines_sel, components_sel,
+        bom_lookup=bom_lookup
+    )
+    total_boards = query_total_boards(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel)
+    boards_run_by_board = query_boards_run_by_board(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel)
 
     st.session_state.events_df = events_df
-    st.session_state.boards_count = boards_count
+    st.session_state.total_boards = int(total_boards)
+    st.session_state.boards_run_by_board = boards_run_by_board
     st.session_state.has_results = True
 
 # ---------- View selector ----------
@@ -508,12 +621,12 @@ if not st.session_state.has_results:
     st.stop()
 
 events_df = st.session_state.events_df.copy()
-boards_count = int(st.session_state.boards_count)
+total_boards = int(st.session_state.total_boards)
+boards_run_by_board = st.session_state.boards_run_by_board.copy()
 
 # ---------- VIEWS ----------
 if view == "Summary":
-    summary = make_summary(events_df)
-    st.dataframe(summary, use_container_width=True)
+    st.dataframe(make_summary(events_df), use_container_width=True)
 
 elif view == "Spit Events":
     st.dataframe(events_df, use_container_width=True)
@@ -526,26 +639,24 @@ elif view == "Pareto (Cost)":
         st.bar_chart(pareto)
 
 elif view == "Repeated Locations":
-    rep = make_repeated_locations(events_df)
-    st.dataframe(rep, use_container_width=True)
+    st.dataframe(make_repeated_locations(events_df), use_container_width=True)
 
 elif view == "Yield Loss":
     total_cost = float(events_df["Cost"].sum()) if not events_df.empty else 0.0
-    st.metric("Boards Run (files)", boards_count)
+    st.metric("Boards Run (files)", total_boards)
     st.metric("Total Cost Loss", round(total_cost, 2))
-    st.metric("Avg Cost / Board", round(total_cost / boards_count, 2) if boards_count else 0.0)
+    st.metric("Avg Cost / Board", round(total_cost / total_boards, 2) if total_boards else 0.0)
 
 elif view == "Missing BOM Costs":
-    missing = make_missing_costs(events_df)
-    st.dataframe(missing, use_container_width=True)
+    st.dataframe(make_missing_costs(events_df), use_container_width=True)
 
 elif view == "Board Loss %":
     if events_df.empty:
         st.info("No events in this selection.")
     else:
-        board_loss = events_df.groupby("Board")["Cost"].sum().reset_index()
-        board_loss["Loss % of Board Value"] = (board_loss["Cost"] / board_value * 100) if board_value else np.nan
-        st.dataframe(board_loss.sort_values("Loss % of Board Value", ascending=False), use_container_width=True)
+        bl = events_df.groupby("Board")["Cost"].sum().reset_index()
+        bl["Loss % of Board Value (period)"] = (bl["Cost"] / board_value * 100) if board_value else np.nan
+        st.dataframe(bl.sort_values("Loss % of Board Value (period)", ascending=False), use_container_width=True)
 
 elif view == "Board Loss Components":
     if events_df.empty:
@@ -553,11 +664,46 @@ elif view == "Board Loss Components":
     else:
         comp_loss = (
             events_df.groupby(["Board", "Component"])
-            .agg(Spits=("Component", "count"), Cost=("Cost", "sum"))
+            .agg(
+                Spits=("Component", "count"),
+                Cost=("Cost", "sum"),
+                UnitCost=("UnitCost", "max"),
+                Description=("Description", lambda x: x.mode().iloc[0] if len(x.mode()) else x.iloc[0]),
+            )
             .reset_index()
         )
-        comp_loss["Loss % of Board Value"] = (comp_loss["Cost"] / board_value * 100) if board_value else np.nan
+
+        # Merge boards run per board (within filtered selection window)
+        comp_loss = comp_loss.merge(boards_run_by_board, on="Board", how="left")
+        comp_loss["BoardsRun"] = comp_loss["BoardsRun"].fillna(0).astype(int)
+
+        # Two useful % metrics:
+        # 1) Period % of Board Value (over this selection window)
+        comp_loss["Period % of Board Value"] = (
+            (comp_loss["Cost"] / board_value) * 100
+            if board_value else np.nan
+        )
+
+        # 2) Avg % of Board Value per Board (your requested metric)
+        comp_loss["Avg % of Board Value per Board"] = np.where(
+            (board_value > 0) & (comp_loss["BoardsRun"] > 0),
+            (comp_loss["Cost"] / (board_value * comp_loss["BoardsRun"])) * 100,
+            np.nan
+        )
+
+        # Also useful: share of the board's total loss during the period
+        board_total = comp_loss.groupby("Board")["Cost"].transform("sum")
+        comp_loss["% of Board’s Total Loss"] = np.where(board_total > 0, (comp_loss["Cost"] / board_total) * 100, 0.0)
+
         comp_loss = comp_loss.sort_values(["Board", "Cost"], ascending=[True, False])
+
+        # Nice column order
+        comp_loss = comp_loss[
+            ["Board","BoardsRun","Component","Description","Spits","UnitCost","Cost",
+             "Period % of Board Value","Avg % of Board Value per Board","% of Board’s Total Loss"]
+        ]
+
         st.dataframe(comp_loss, use_container_width=True)
+
 
 
