@@ -9,7 +9,7 @@ from pandas.errors import EmptyDataError
 # CONFIG
 # ---------------------------------------------------------
 st.set_page_config(page_title="SMT Spit Analytics", layout="wide")
-REJECT_CODES = {2, 3, 4, 5, 7}
+REJECT_CODES = {2, 3, 4, 5, 6, 7}
 
 # ---------------------------------------------------------
 # HELPERS
@@ -33,11 +33,6 @@ def extract_component(text):
     return m.group(1).strip() if m else None
 
 def safe_read_csv(bytes_data, **kwargs):
-    """
-    Robust CSV read:
-    - try utf-8 then latin-1
-    - lets EmptyDataError bubble up so caller can handle it
-    """
     try:
         return pd.read_csv(io.BytesIO(bytes_data), encoding="utf-8", **kwargs)
     except UnicodeDecodeError:
@@ -71,7 +66,7 @@ def load_bom(bom_bytes):
     )
 
 # ---------------------------------------------------------
-# READ LOG FILES (HARDENED AGAINST EMPTY/ODD FILES)
+# READ LOG FILES
 # ---------------------------------------------------------
 def read_logs(log_files, cost_lookup):
     events = []
@@ -86,7 +81,7 @@ def read_logs(log_files, cost_lookup):
             skipped.append((name, "Empty file (0 bytes)"))
             continue
 
-        # -------- HEADER (row 1) --------
+        # Header
         try:
             try:
                 header = pd.read_excel(io.BytesIO(data), nrows=1, header=None)
@@ -99,7 +94,6 @@ def read_logs(log_files, cost_lookup):
             skipped.append((name, f"Header read failed: {type(e).__name__}"))
             continue
 
-        # validate header has required cells (B1, D1, I1, L1)
         try:
             board = str(header.iloc[0, 1]).strip()     # B1
             mo = str(header.iloc[0, 3]).strip()        # D1
@@ -109,7 +103,7 @@ def read_logs(log_files, cost_lookup):
             skipped.append((name, "Header missing required cells (B1/D1/I1/L1)"))
             continue
 
-        # -------- BODY (skip first 2 rows, first 12 cols) --------
+        # Body
         try:
             try:
                 df = pd.read_excel(io.BytesIO(data), skiprows=2, header=None, usecols=range(12))
@@ -126,13 +120,7 @@ def read_logs(log_files, cost_lookup):
             skipped.append((name, "Dataframe empty after read"))
             continue
 
-        # ensure 12 cols exist even if pandas returned fewer for some reason
-        try:
-            df = df.iloc[:, :12]
-        except Exception:
-            skipped.append((name, "Could not slice first 12 columns"))
-            continue
-
+        df = df.iloc[:, :12]
         if df.shape[1] < 12:
             skipped.append((name, f"Only {df.shape[1]} columns found (need 12)"))
             continue
@@ -158,7 +146,6 @@ def read_logs(log_files, cost_lookup):
                         "Cost": cost
                     })
             except Exception:
-                # ignore bad rows
                 continue
 
         files.append({"File": name, "Board": board, "MO": mo, "Spits": spit_count})
@@ -166,9 +153,54 @@ def read_logs(log_files, cost_lookup):
     return pd.DataFrame(events), pd.DataFrame(files), skipped
 
 # ---------------------------------------------------------
+# DERIVED TABLES (for views)
+# ---------------------------------------------------------
+def build_summary(events_df):
+    if len(events_df) == 0:
+        return pd.DataFrame(columns=["Component","Description","Machine","Spits","Unit_Cost","Total_Cost"])
+
+    return (
+        events_df.groupby("Component")
+        .agg(
+            Description=("Description", lambda x: x.mode().iloc[0] if len(x.mode()) else x.iloc[0]),
+            Machine=("Machine", lambda x: x.mode().iloc[0] if len(x.mode()) else x.iloc[0]),
+            Spits=("Component", "count"),
+            Unit_Cost=("Unit Cost", "max"),
+            Total_Cost=("Cost", "sum"),
+        )
+        .reset_index()
+        .sort_values("Total_Cost", ascending=False)
+    )
+
+def build_repeated_locations(events_df):
+    if len(events_df) == 0:
+        return pd.DataFrame(columns=["Component","Location","Machine","Spits"])
+    return (
+        events_df.groupby(["Component","Location","Machine"])
+        .size()
+        .reset_index(name="Spits")
+        .query("Spits > 1")
+        .sort_values("Spits", ascending=False)
+    )
+
+def build_missing_costs(events_df):
+    if len(events_df) == 0:
+        return pd.DataFrame(columns=["Component","Spits (cost=0)"])
+    return (
+        events_df.loc[events_df["Unit Cost"] == 0.0, "Component"]
+        .value_counts()
+        .reset_index()
+        .rename(columns={"index":"Component", "Component":"Spits (cost=0)"})
+    )
+
+# ---------------------------------------------------------
 # UI
 # ---------------------------------------------------------
 st.title("SMT Spit Analytics Dashboard")
+
+# Initialize storage
+if "has_results" not in st.session_state:
+    st.session_state.has_results = False
 
 st.subheader("Inputs")
 log_files = st.file_uploader(
@@ -176,133 +208,126 @@ log_files = st.file_uploader(
     type=["csv", "xls", "xlsx"],
     accept_multiple_files=True
 )
-
 bom_file = st.file_uploader(
     "Upload BOM Excel (all sheets read; Component in [ ] in column A, Cost in column K)",
     type=["xls", "xlsx"]
 )
-
 board_value = st.number_input(
     "Board value (used for % loss calculations)",
     min_value=0.0,
-    value=0.0
+    value=st.session_state.get("board_value", 0.0)
 )
 
 run = st.button("Run Analysis", type="primary")
 
-if run and log_files and bom_file:
-    cost_lookup = load_bom(bom_file.getvalue())
-    events_df, files_df, skipped = read_logs(log_files, cost_lookup)
+# When user clicks Run: compute and store results
+if run:
+    st.session_state.board_value = float(board_value)
 
-    if skipped:
-        with st.expander(f"Skipped files ({len(skipped)})", expanded=True):
-            st.dataframe(pd.DataFrame(skipped, columns=["File", "Reason"]), use_container_width=True)
+    if not log_files or not bom_file:
+        st.warning("Please upload log files and a BOM file first.")
+    else:
+        cost_lookup = load_bom(bom_file.getvalue())
+        events_df, files_df, skipped = read_logs(log_files, cost_lookup)
 
-    if len(files_df) == 0:
-        st.error("No valid log files were processed. Please check the skipped files list.")
-        st.stop()
+        st.session_state.events_df = events_df
+        st.session_state.files_df = files_df
+        st.session_state.skipped = skipped
 
-    st.success(f"Done. Boards processed: {len(files_df)} | Spit events: {len(events_df)}")
+        # derived
+        st.session_state.summary_df = build_summary(events_df)
+        st.session_state.repeated_df = build_repeated_locations(events_df)
+        st.session_state.missing_df = build_missing_costs(events_df)
 
-    view = st.selectbox(
-        "Select View",
-        [
-            "Summary",
-            "Spit Events",
-            "Pareto (Cost)",
-            "Repeated Locations",
-            "Yield Loss",
-            "Missing BOM Costs",
-            "Board Loss %",
-            "Board Loss Components"
-        ]
-    )
+        st.session_state.has_results = True
 
-    if view == "Summary":
-        if len(events_df) == 0:
-            st.info("No spit events found in the selected logs.")
-        else:
-            summary = (
-                events_df.groupby("Component")
-                .agg(
-                    Description=("Description", lambda x: x.mode().iloc[0] if len(x.mode()) else x.iloc[0]),
-                    Machine=("Machine", lambda x: x.mode().iloc[0] if len(x.mode()) else x.iloc[0]),
-                    Spits=("Component", "count"),
-                    Unit_Cost=("Unit Cost", "max"),
-                    Total_Cost=("Cost", "sum")
-                )
-                .reset_index()
-                .sort_values("Total_Cost", ascending=False)
-            )
-            st.dataframe(summary, use_container_width=True)
+# Always show skipped files if we have them
+if st.session_state.get("skipped"):
+    with st.expander(f"Skipped files ({len(st.session_state.skipped)})", expanded=False):
+        st.dataframe(pd.DataFrame(st.session_state.skipped, columns=["File", "Reason"]), use_container_width=True)
 
-    elif view == "Spit Events":
-        st.dataframe(events_df, use_container_width=True)
+# View selector always visible (but shows data only after analysis)
+view = st.selectbox(
+    "Select View",
+    [
+        "Summary",
+        "Spit Events",
+        "Pareto (Cost)",
+        "Repeated Locations",
+        "Yield Loss",
+        "Missing BOM Costs",
+        "Board Loss %",
+        "Board Loss Components"
+    ],
+    index=0
+)
 
-    elif view == "Pareto (Cost)":
-        if len(events_df) == 0:
-            st.info("No spit events found.")
-        else:
-            pareto = events_df.groupby("Component")["Cost"].sum().sort_values(ascending=False)
-            st.bar_chart(pareto)
+if not st.session_state.has_results:
+    st.info("Upload files, then click **Run Analysis** once. After that, you can switch views freely.")
+    st.stop()
 
-    elif view == "Repeated Locations":
-        if len(events_df) == 0:
-            st.info("No spit events found.")
-        else:
-            rep = (
-                events_df.groupby(["Component", "Location", "Machine"])
-                .size()
-                .reset_index(name="Spits")
-                .query("Spits > 1")
-                .sort_values("Spits", ascending=False)
-            )
-            st.dataframe(rep, use_container_width=True)
+events_df = st.session_state.events_df
+files_df = st.session_state.files_df
+board_value = float(st.session_state.get("board_value", 0.0))
 
-    elif view == "Yield Loss":
-        total_boards = len(files_df)
-        total_cost = float(events_df["Cost"].sum()) if len(events_df) else 0.0
-        st.metric("Total Boards Run", total_boards)
-        st.metric("Total Cost Loss", round(total_cost, 2))
-        st.metric("Avg Cost / Board", round(total_cost / total_boards, 2) if total_boards else 0)
+# ------------------------- VIEWS -------------------------
+if view == "Summary":
+    st.dataframe(st.session_state.summary_df, use_container_width=True)
 
-    elif view == "Missing BOM Costs":
-        if len(events_df) == 0:
-            st.info("No spit events found.")
-        else:
-            missing = (
-                events_df.loc[events_df["Unit Cost"] == 0.0, "Component"]
-                .value_counts()
-                .reset_index()
-                .rename(columns={"index": "Component", "Component": "Spits (cost=0)"})
-            )
-            st.dataframe(missing, use_container_width=True)
+elif view == "Spit Events":
+    st.dataframe(events_df, use_container_width=True)
 
-    elif view == "Board Loss %":
-        if len(events_df) == 0:
-            st.info("No spit events found.")
-        else:
-            board_loss = events_df.groupby("Board")["Cost"].sum().reset_index()
-            board_loss["Loss % of Board Value"] = (
-                (board_loss["Cost"] / board_value) * 100 if board_value else np.nan
-            )
-            st.dataframe(board_loss, use_container_width=True)
+elif view == "Pareto (Cost)":
+    if len(events_df) == 0:
+        st.info("No spit events found.")
+    else:
+        pareto = events_df.groupby("Component")["Cost"].sum().sort_values(ascending=False)
+        st.bar_chart(pareto)
 
-    elif view == "Board Loss Components":
-        if len(events_df) == 0:
-            st.info("No spit events found.")
-        else:
-            comp_loss = (
-                events_df.groupby(["Board", "Component"])
-                .agg(Spits=("Component", "count"), Cost=("Cost", "sum"))
-                .reset_index()
-                .sort_values(["Board", "Cost"], ascending=[True, False])
-            )
-            comp_loss["Loss % of Board Value"] = (
-                (comp_loss["Cost"] / board_value) * 100 if board_value else np.nan
-            )
-            st.dataframe(comp_loss, use_container_width=True)
+elif view == "Repeated Locations":
+    st.dataframe(st.session_state.repeated_df, use_container_width=True)
 
-else:
-    st.info("Upload log files + BOM, enter board value, then click Run Analysis.")
+elif view == "Yield Loss":
+    total_boards = len(files_df)
+    total_cost = float(events_df["Cost"].sum()) if len(events_df) else 0.0
+    st.metric("Total Boards Run", total_boards)
+    st.metric("Total Cost Loss", round(total_cost, 2))
+    st.metric("Avg Cost / Board", round(total_cost / total_boards, 2) if total_boards else 0)
+
+    st.subheader("MO-wise")
+    mo_view = files_df.groupby("MO").agg(Boards=("File", "count"), Spits=("Spits", "sum")).reset_index()
+    st.dataframe(mo_view, use_container_width=True)
+
+    st.subheader("Board-wise")
+    b_view = files_df.groupby("Board").agg(Boards=("File", "count"), Spits=("Spits", "sum")).reset_index()
+    st.dataframe(b_view, use_container_width=True)
+
+elif view == "Missing BOM Costs":
+    st.dataframe(st.session_state.missing_df, use_container_width=True)
+
+elif view == "Board Loss %":
+    if len(events_df) == 0:
+        st.info("No spit events found.")
+    else:
+        board_loss = events_df.groupby("Board")["Cost"].sum().reset_index()
+        board_loss["Loss % of Board Value"] = (
+            (board_loss["Cost"] / board_value) * 100 if board_value else np.nan
+        )
+        st.dataframe(board_loss, use_container_width=True)
+
+elif view == "Board Loss Components":
+    if len(events_df) == 0:
+        st.info("No spit events found.")
+    else:
+        comp_loss = (
+            events_df.groupby(["Board", "Component"])
+            .agg(Spits=("Component", "count"), Cost=("Cost", "sum"))
+            .reset_index()
+            .sort_values(["Board", "Cost"], ascending=[True, False])
+        )
+        comp_loss["Loss % of Board Value"] = (
+            (comp_loss["Cost"] / board_value) * 100 if board_value else np.nan
+        )
+        st.dataframe(comp_loss, use_container_width=True)
+
 
