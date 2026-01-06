@@ -21,9 +21,9 @@ REJECT_CODES = {2, 3, 4, 5, 7}
 # YYYYMMDDHHMMSS-MACHINE(.ext)
 FILENAME_RE = re.compile(r"^(?P<dt>\d{14})-(?P<machine>.+?)(?:\.[A-Za-z0-9]+)?$")
 
-# Master BOM format:
-# - Column A: contains text with [COMPONENT]
-# - Column J: cost
+# Master BOM format (NEW):
+# - Column A: Component (direct name, no brackets)
+# - Column J: Cost
 MASTER_BOM_COMP_COL_INDEX = 0   # A
 MASTER_BOM_COST_COL_INDEX = 9   # J
 
@@ -106,18 +106,11 @@ def parse_cost(v):
     if isinstance(v, (int, float, np.number)):
         return float(v)
     s = str(v).replace(",", "")
-    s = re.sub(r"[^\d\.\-]", "", s)
+    s = re.sub(r"[^\d\.\-]", "", s)  # strip currency symbols etc.
     try:
         return float(s)
     except:
         return np.nan
-
-def extract_component_from_text(text):
-    """Extract component inside [ ] from a cell string."""
-    if pd.isna(text):
-        return None
-    m = re.search(r"\[(.*?)\]", str(text))
-    return m.group(1).strip() if m else None
 
 def parse_dt_machine_from_filename(filename: str):
     base = os.path.basename(filename)
@@ -177,13 +170,13 @@ def read_body_df(file_bytes: bytes, filename: str):
     return df
 
 # =========================================================
-# BOM INGEST (MASTER BOM, VERSIONED)
+# BOM INGEST (MASTER BOM, VERSIONED) - UPDATED
 # =========================================================
 def ingest_master_bom(conn: sqlite3.Connection, bom_bytes: bytes, bom_name: str) -> int:
     """
     Master BOM:
-    - Component text in column A (index 0), component inside [ ]
-    - Cost in column J (index 9)
+    - Component is directly in Column A (index 0)
+    - Cost is in Column J (index 9)
     Reads ALL sheets.
     Stores as new bom_version.
     """
@@ -193,13 +186,20 @@ def ingest_master_bom(conn: sqlite3.Connection, bom_bytes: bytes, bom_name: str)
     for sheet in xls.sheet_names:
         df = pd.read_excel(xls, sheet_name=sheet, header=None)
 
+        if df is None or df.empty:
+            continue
+
+        # Must have at least columns A..J
         if df.shape[1] <= max(MASTER_BOM_COMP_COL_INDEX, MASTER_BOM_COST_COL_INDEX):
             continue
 
         for i in range(len(df)):
-            comp_text = df.iat[i, MASTER_BOM_COMP_COL_INDEX]
-            comp = extract_component_from_text(comp_text)
-            if not comp:
+            comp = df.iat[i, MASTER_BOM_COMP_COL_INDEX]
+            if pd.isna(comp):
+                continue
+            comp = str(comp).strip()
+            if not comp or comp.lower() in {"component", "part", "part number", "item"}:
+                # skip possible header text if present
                 continue
 
             raw_cost = df.iat[i, MASTER_BOM_COST_COL_INDEX]
@@ -207,7 +207,7 @@ def ingest_master_bom(conn: sqlite3.Connection, bom_bytes: bytes, bom_name: str)
             if pd.isna(cost):
                 continue
 
-            items.append((str(comp).strip(), float(cost)))
+            items.append((comp, float(cost)))
 
     if not items:
         return 0
@@ -219,7 +219,7 @@ def ingest_master_bom(conn: sqlite3.Connection, bom_bytes: bytes, bom_name: str)
     )
     bom_id = cur.lastrowid
 
-    # Keep last cost per component in THIS upload
+    # last cost wins within this upload
     tmp = {}
     for comp, cost in items:
         tmp[comp] = cost
@@ -277,7 +277,6 @@ def get_bom_lookup(conn: sqlite3.Connection, selected_bom_ids: list[int] | None)
 # LOG INGEST (EVENTS STORED)
 # =========================================================
 def ingest_logs(conn: sqlite3.Connection, uploads):
-    # Assign a cost at ingest time using default BOM behavior (latest across all BOM versions).
     bom_lookup = get_bom_lookup(conn, selected_bom_ids=None)
 
     skipped = []
@@ -398,7 +397,6 @@ def query_events(conn: sqlite3.Connection,
 
     df = pd.read_sql_query(sql, conn, params=params)
 
-    # Recompute costs for THIS analysis run using selected BOM(s)
     if df.empty:
         df["UnitCost"] = []
         df["Cost"] = []
@@ -481,8 +479,7 @@ db_init(conn)
 
 st.title("SMT Spit Analytics (Database Mode)")
 
-# ---------- View uploaded files/BOMs ----------
-with st.expander("📚 View uploaded Logs and BOMs"):
+with st.expander("📚 View uploaded Logs and Master BOM versions"):
     cA, cB = st.columns(2)
 
     with cA:
@@ -504,18 +501,17 @@ with st.expander("📚 View uploaded Logs and BOMs"):
         else:
             st.dataframe(logs_df, use_container_width=True, height=240)
 
-# ---------- Admin: BOM + Log ingest ----------
 with st.expander("📦 Data Store (upload once, reuse later)", expanded=True):
     col1, col2 = st.columns(2)
 
     with col1:
         st.subheader("Upload Master BOM (stored as version)")
         bom_up = st.file_uploader(
-            "Master BOM Excel (all sheets read). Component in column A as [COMP], Cost in column J.",
+            "Master BOM Excel (all sheets read). Component in column A, Cost in column J.",
             type=["xls", "xlsx"],
             key="bom_up"
         )
-        bom_name = st.text_input("BOM name/label (e.g. Master BOM Feb-2026)", value="", key="bom_name")
+        bom_name = st.text_input("BOM name/label (e.g. Master BOM Jan-2026)", value="", key="bom_name")
         if st.button("Save Master BOM to Database", type="secondary"):
             if not bom_up:
                 st.warning("Upload a Master BOM file first.")
@@ -523,7 +519,7 @@ with st.expander("📦 Data Store (upload once, reuse later)", expanded=True):
                 label = bom_name.strip() if bom_name.strip() else bom_up.name
                 n = ingest_master_bom(conn, bom_up.getvalue(), label)
                 if n == 0:
-                    st.error("No BOM items were loaded. Check: component in [ ] in column A and cost in column J.")
+                    st.error("No BOM items were loaded. Check: component in column A, cost in column J.")
                 else:
                     st.success(f"Master BOM stored as a new version. Components loaded: {n}")
 
@@ -544,7 +540,6 @@ with st.expander("📦 Data Store (upload once, reuse later)", expanded=True):
                 if skipped:
                     st.dataframe(pd.DataFrame(skipped, columns=["File", "Reason"]), use_container_width=True)
 
-# ---------- Filter panel ----------
 st.subheader("🔎 Filters (combine as needed)")
 
 today = date.today()
@@ -569,7 +564,6 @@ with c4:
 dt_start = datetime.combine(start_date, start_time)
 dt_end = datetime.combine(end_date, end_time)
 
-# Options from DB
 boards_all = [r[0] for r in conn.execute(
     "SELECT DISTINCT board_name FROM logs WHERE board_name IS NOT NULL AND board_name <> '' ORDER BY board_name"
 ).fetchall()]
@@ -583,7 +577,6 @@ components_all = [r[0] for r in conn.execute(
     "SELECT DISTINCT component FROM events WHERE component IS NOT NULL AND component <> '' ORDER BY component"
 ).fetchall()]
 
-# BOM selector options
 boms_df = list_boms(conn)
 bom_labels = []
 bom_id_by_label = {}
@@ -612,18 +605,12 @@ with f4:
 
 selected_bom_ids = [bom_id_by_label[x] for x in selected_boms_labels] if selected_boms_labels else []
 
-# ---------- Persist results so dropdown works ----------
 if "has_results" not in st.session_state:
     st.session_state.has_results = False
 
 if run_query:
     bom_lookup = get_bom_lookup(conn, selected_bom_ids if selected_bom_ids else None)
-
-    events_df = query_events(
-        conn, dt_start, dt_end,
-        boards_sel, mos_sel, machines_sel, components_sel,
-        bom_lookup=bom_lookup
-    )
+    events_df = query_events(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel, components_sel, bom_lookup=bom_lookup)
     total_boards = query_total_boards(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel)
     boards_run_by_board = query_boards_run_by_board(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel)
 
@@ -632,7 +619,6 @@ if run_query:
     st.session_state.boards_run_by_board = boards_run_by_board
     st.session_state.has_results = True
 
-# ---------- View selector ----------
 view = st.selectbox(
     "Select View",
     [
@@ -656,7 +642,6 @@ events_df = st.session_state.events_df.copy()
 total_boards = int(st.session_state.total_boards)
 boards_run_by_board = st.session_state.boards_run_by_board.copy()
 
-# ---------- VIEWS ----------
 if view == "Summary":
     st.dataframe(make_summary(events_df), use_container_width=True)
 
@@ -726,8 +711,8 @@ elif view == "Board Loss Components":
             ["Board","BoardsRun","Component","Description","Spits","UnitCost","Cost",
              "Period % of Board Value","Avg % of Board Value per Board","% of Board’s Total Loss"]
         ]
-
         st.dataframe(comp_loss, use_container_width=True)
+
 
 
 
