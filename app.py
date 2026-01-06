@@ -18,11 +18,12 @@ DB_PATH = "smt_spit.db"
 REJECT_CODES = {2, 3, 4, 5, 7}
 
 # Filename example: 20260106091251-IIN2-053-2.csv
+# YYYYMMDDHHMMSS-MACHINE(.ext)
 FILENAME_RE = re.compile(r"^(?P<dt>\d{14})-(?P<machine>.+?)(?:\.[A-Za-z0-9]+)?$")
 
 # Master BOM:
-# - Column A: Component name (direct)
-# - Column J: Cost
+# Column A = component
+# Column J = cost
 MASTER_BOM_COMP_COL_INDEX = 0  # A
 MASTER_BOM_COST_COL_INDEX = 9  # J
 
@@ -66,7 +67,6 @@ def db_init(conn: sqlite3.Connection):
         ingested_at TEXT NOT NULL
     )
     """)
-
     conn.execute("""
     CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -103,7 +103,7 @@ def parse_cost(v):
     if isinstance(v, (int, float, np.number)):
         return float(v)
     s = str(v).replace(",", "")
-    s = re.sub(r"[^\d\.\-]", "", s)
+    s = re.sub(r"[^\d\.\-]", "", s)  # strip currency symbols etc.
     try:
         return float(s)
     except:
@@ -128,7 +128,7 @@ def safe_read_csv(bytes_data, **kwargs):
     except UnicodeDecodeError:
         return pd.read_csv(io.BytesIO(bytes_data), encoding="latin-1", **kwargs)
 
-def _clean_header_cell(x):
+def _clean_cell(x):
     """Convert NaN/None/'nan'/'None'/'' to None; else stripped string."""
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return None
@@ -140,8 +140,7 @@ def _clean_header_cell(x):
 def read_header_board_mo(file_bytes: bytes, filename: str):
     """
     Reads first row (row 1 in Excel terms).
-    Board name expected at B1, MO at D1.
-    Robust: handles both Excel and CSV.
+    Board: B1, MO: D1
     """
     ext = filename.lower().split(".")[-1]
     try:
@@ -153,14 +152,14 @@ def read_header_board_mo(file_bytes: bytes, filename: str):
         return None, None
 
     try:
-        board = _clean_header_cell(header.iloc[0, 1])  # B1
-        mo = _clean_header_cell(header.iloc[0, 3])     # D1
+        board = _clean_cell(header.iloc[0, 1])  # B1
+        mo = _clean_cell(header.iloc[0, 3])     # D1
         return board, mo
     except Exception:
         return None, None
 
 def read_body_df(file_bytes: bytes, filename: str):
-    """Skip first 2 rows; read only A-L (12 cols)."""
+    """Skip first 2 rows; read only first 12 columns A-L."""
     ext = filename.lower().split(".")[-1]
     try:
         if ext in ("xls", "xlsx"):
@@ -174,9 +173,11 @@ def read_body_df(file_bytes: bytes, filename: str):
 
     if df is None or df.empty:
         return None
+
     df = df.iloc[:, :12]
     if df.shape[1] < 12:
         return None
+
     df.columns = list("ABCDEFGHIJKL")
     return df
 
@@ -184,6 +185,12 @@ def read_body_df(file_bytes: bytes, filename: str):
 # BOM INGEST (MASTER BOM, VERSIONED)
 # =========================================================
 def ingest_master_bom(conn: sqlite3.Connection, bom_bytes: bytes, bom_name: str) -> int:
+    """
+    Master BOM:
+      - Component: column A
+      - Cost: column J
+    Reads ALL sheets.
+    """
     xls = pd.ExcelFile(io.BytesIO(bom_bytes))
     items = []
 
@@ -199,13 +206,15 @@ def ingest_master_bom(conn: sqlite3.Connection, bom_bytes: bytes, bom_name: str)
             continue
 
         for i in range(len(df)):
-            comp = df.iat[i, MASTER_BOM_COMP_COL_INDEX]
-            comp = _clean_header_cell(comp)
+            comp = _clean_cell(df.iat[i, MASTER_BOM_COMP_COL_INDEX])
             if not comp:
                 continue
 
-            raw_cost = df.iat[i, MASTER_BOM_COST_COL_INDEX]
-            cost = parse_cost(raw_cost)
+            # Skip obvious header-ish rows
+            if comp.lower() in {"component", "part", "part number", "item", "sku", "barcode", "display name"}:
+                continue
+
+            cost = parse_cost(df.iat[i, MASTER_BOM_COST_COL_INDEX])
             if pd.isna(cost):
                 continue
 
@@ -221,6 +230,7 @@ def ingest_master_bom(conn: sqlite3.Connection, bom_bytes: bytes, bom_name: str)
     )
     bom_id = cur.lastrowid
 
+    # last cost wins within this upload
     tmp = {}
     for comp, cost in items:
         tmp[comp] = cost
@@ -239,6 +249,12 @@ def list_boms(conn: sqlite3.Connection) -> pd.DataFrame:
     )
 
 def get_bom_lookup(conn: sqlite3.Connection, selected_bom_ids: list[int] | None) -> dict:
+    """
+    If selected_bom_ids is empty/None:
+      - Use latest cost per component across ALL BOM versions
+    If selected_bom_ids provided:
+      - Use only those versions; newest bom_id wins per component.
+    """
     if not selected_bom_ids:
         sql = """
         SELECT bi.component, bi.unit_cost
@@ -272,6 +288,7 @@ def get_bom_lookup(conn: sqlite3.Connection, selected_bom_ids: list[int] | None)
 # LOG INGEST
 # =========================================================
 def ingest_logs(conn: sqlite3.Connection, uploads):
+    # Cost at ingest uses latest across all versions (can be recomputed at query time too)
     bom_lookup = get_bom_lookup(conn, selected_bom_ids=None)
 
     skipped = []
@@ -299,7 +316,6 @@ def ingest_logs(conn: sqlite3.Connection, uploads):
             skipped.append((filename, "No readable data after skiprows=2"))
             continue
 
-        # IMPORTANT: store None (not "nan") if missing
         conn.execute(
             "INSERT INTO logs(file_hash, filename, file_dt, machine, board_name, mo, ingested_at) VALUES (?,?,?,?,?,?,?)",
             (file_hash, filename, dt_iso, machine, board, mo, datetime.now().isoformat(sep=" "))
@@ -388,6 +404,7 @@ def query_events(conn, dt_start, dt_end, boards, mos, machines, components, bom_
         df["Cost"] = []
         return df
 
+    # recompute costs based on selected BOM(s)
     df["UnitCost"] = df["Component"].map(lambda c: float(bom_lookup.get(str(c).strip(), 0.0)))
     df["Cost"] = df["UnitCost"]
     return df
@@ -399,12 +416,13 @@ def query_total_boards(conn, dt_start, dt_end, boards, mos, machines):
         sql += " WHERE " + " AND ".join(where)
     return int(conn.execute(sql, params).fetchone()[0])
 
-def query_boards_run_by_board(conn, dt_start, dt_end, boards, mos, machines):
-    """
-    Boards run per board_name FROM LOGS using the SAME filters.
-    This is what drives BoardsRun for Board Loss Components and Yield Loss breakdown.
-    """
+def query_boards_run_by_board(conn, dt_start, dt_end, boards, mos, machines, boards_limit=None):
     where, params = _build_where(dt_start, dt_end, boards, mos, machines, components=None)
+
+    if boards_limit:
+        where.append("board_name IN (%s)" % ",".join(["?"] * len(boards_limit)))
+        params.extend(boards_limit)
+
     sql = "SELECT board_name AS Board, COUNT(*) AS BoardsRun FROM logs"
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -459,21 +477,28 @@ db_init(conn)
 
 st.title("SMT Spit Analytics (Database Mode)")
 
+# ---- View uploaded files and BOMs
 with st.expander("📚 View uploaded Logs and Master BOM versions"):
     cA, cB = st.columns(2)
     with cA:
         st.subheader("Master BOM versions uploaded")
         boms_df = list_boms(conn)
-        st.dataframe(boms_df, use_container_width=True, height=240) if not boms_df.empty else st.info("No BOMs stored yet.")
+        if boms_df.empty:
+            st.info("No BOMs stored yet.")
+        else:
+            st.dataframe(boms_df, use_container_width=True, height=240)
     with cB:
         st.subheader("Log files ingested (latest 200)")
         logs_df = pd.read_sql_query(
             "SELECT filename, file_dt, machine, board_name, mo, ingested_at FROM logs ORDER BY ingested_at DESC LIMIT 200",
             conn
         )
-        st.dataframe(logs_df, use_container_width=True, height=240) if not logs_df.empty else st.info("No logs ingested yet.")
+        if logs_df.empty:
+            st.info("No logs ingested yet.")
+        else:
+            st.dataframe(logs_df, use_container_width=True, height=240)
 
-# Quick sanity check: do we actually have board_name distribution?
+# ---- Board distribution sanity check (helps debug BoardsRun)
 with st.expander("✅ Sanity check: Boards in DB (counts)"):
     bc = pd.read_sql_query(
         "SELECT COALESCE(board_name,'(blank)') AS Board, COUNT(*) AS BoardsRun FROM logs GROUP BY board_name ORDER BY BoardsRun DESC LIMIT 50",
@@ -492,15 +517,17 @@ with st.expander("📦 Data Store (upload once, reuse later)", expanded=True):
             key="bom_up"
         )
         bom_name = st.text_input("BOM name/label (e.g. Master BOM Jan-2026)", value="", key="bom_name")
+
         if st.button("Save Master BOM to Database", type="secondary"):
             if not bom_up:
                 st.warning("Upload a Master BOM file first.")
             else:
                 label = bom_name.strip() if bom_name.strip() else bom_up.name
                 n = ingest_master_bom(conn, bom_up.getvalue(), label)
-                st.success(f"Master BOM stored. Components loaded: {n}") if n else st.error(
-                    "No BOM items were loaded. Check: component in column A and cost in column J."
-                )
+                if n == 0:
+                    st.error("No BOM items were loaded. Check: component in column A and cost in column J.")
+                else:
+                    st.success(f"Master BOM stored. Components loaded: {n}")
 
     with col2:
         st.subheader("Ingest Log Files")
@@ -519,6 +546,7 @@ with st.expander("📦 Data Store (upload once, reuse later)", expanded=True):
                 if skipped:
                     st.dataframe(pd.DataFrame(skipped, columns=["File", "Reason"]), use_container_width=True)
 
+# ---- Filters
 st.subheader("🔎 Filters (combine as needed)")
 
 today = date.today()
@@ -542,6 +570,7 @@ with c4:
 dt_start = datetime.combine(start_date, start_time)
 dt_end = datetime.combine(end_date, end_time)
 
+# Filter lists
 boards_all = [r[0] for r in conn.execute(
     "SELECT DISTINCT board_name FROM logs WHERE board_name IS NOT NULL AND board_name <> '' ORDER BY board_name"
 ).fetchall()]
@@ -555,6 +584,7 @@ components_all = [r[0] for r in conn.execute(
     "SELECT DISTINCT component FROM events WHERE component IS NOT NULL AND component <> '' ORDER BY component"
 ).fetchall()]
 
+# BOM selector
 boms_df = list_boms(conn)
 bom_labels = []
 bom_id_by_label = {}
@@ -583,6 +613,7 @@ with f4:
 
 selected_bom_ids = [bom_id_by_label[x] for x in selected_boms_labels] if selected_boms_labels else []
 
+# ---- Persist results
 if "has_results" not in st.session_state:
     st.session_state.has_results = False
 
@@ -591,9 +622,11 @@ if run_query:
 
     events_df = query_events(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel, components_sel, bom_lookup=bom_lookup)
 
-    # Boards counts come ONLY from LOGS using SAME filters
     total_boards = query_total_boards(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel)
-    boards_run_by_board = query_boards_run_by_board(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel)
+
+    # IMPORTANT: show board breakdown limited to boards in current results
+    boards_in_results = sorted([b for b in events_df["Board"].dropna().astype(str).unique()])
+    boards_run_by_board = query_boards_run_by_board(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel, boards_limit=boards_in_results)
 
     st.session_state.events_df = events_df
     st.session_state.total_boards = int(total_boards)
@@ -623,6 +656,7 @@ events_df = st.session_state.events_df.copy()
 total_boards = int(st.session_state.total_boards)
 boards_run_by_board = st.session_state.boards_run_by_board.copy()
 
+# ---- Views
 if view == "Summary":
     st.dataframe(make_summary(events_df), use_container_width=True)
 
@@ -644,8 +678,11 @@ elif view == "Yield Loss":
     st.metric("Total Cost Loss", round(total_cost, 2))
     st.metric("Avg Cost / Board", round(total_cost / total_boards, 2) if total_boards else 0.0)
 
-    st.subheader("Boards Run breakdown (filtered logs)")
-    st.dataframe(boards_run_by_board.sort_values("BoardsRun", ascending=False), use_container_width=True) if not boards_run_by_board.empty else st.info("No breakdown available.")
+    st.subheader("Boards Run breakdown (filtered)")
+    if boards_run_by_board.empty:
+        st.info("No board-count breakdown for this selection.")
+    else:
+        st.dataframe(boards_run_by_board.sort_values("BoardsRun", ascending=False), use_container_width=True)
 
 elif view == "Missing BOM Costs":
     st.dataframe(make_missing_costs(events_df), use_container_width=True)
@@ -673,11 +710,12 @@ elif view == "Board Loss Components":
             .reset_index()
         )
 
-        # Merge boards run per board from LOGS (already filtered by your filters)
         comp_loss = comp_loss.merge(boards_run_by_board, on="Board", how="left")
         comp_loss["BoardsRun"] = comp_loss["BoardsRun"].fillna(0).astype(int)
 
-        comp_loss["Period % of Board Value"] = ((comp_loss["Cost"] / board_value) * 100) if board_value else np.nan
+        comp_loss["Period % of Board Value"] = (
+            (comp_loss["Cost"] / board_value) * 100 if board_value else np.nan
+        )
         comp_loss["Avg % of Board Value per Board"] = np.where(
             (board_value > 0) & (comp_loss["BoardsRun"] > 0),
             (comp_loss["Cost"] / (board_value * comp_loss["BoardsRun"])) * 100,
@@ -693,8 +731,3 @@ elif view == "Board Loss Components":
              "Period % of Board Value", "Avg % of Board Value per Board", "% of Board’s Total Loss"]
         ]
         st.dataframe(comp_loss, use_container_width=True)
-
-
-
-
-
