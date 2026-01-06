@@ -21,6 +21,12 @@ REJECT_CODES = {2, 3, 4, 5, 7}
 # YYYYMMDDHHMMSS-MACHINE(.ext)
 FILENAME_RE = re.compile(r"^(?P<dt>\d{14})-(?P<machine>.+?)(?:\.[A-Za-z0-9]+)?$")
 
+# Master BOM format:
+# - Column A: contains text with [COMPONENT]
+# - Column J: cost
+MASTER_BOM_COMP_COL_INDEX = 0   # A
+MASTER_BOM_COST_COL_INDEX = 9   # J
+
 # =========================================================
 # DB HELPERS
 # =========================================================
@@ -106,7 +112,8 @@ def parse_cost(v):
     except:
         return np.nan
 
-def extract_component_from_bom_cell(text):
+def extract_component_from_text(text):
+    """Extract component inside [ ] from a cell string."""
     if pd.isna(text):
         return None
     m = re.search(r"\[(.*?)\]", str(text))
@@ -132,6 +139,7 @@ def safe_read_csv(bytes_data, **kwargs):
         return pd.read_csv(io.BytesIO(bytes_data), encoding="latin-1", **kwargs)
 
 def read_header_board_mo(file_bytes: bytes):
+    """Board: B1, MO: D1"""
     try:
         try:
             header = pd.read_excel(io.BytesIO(file_bytes), nrows=1, header=None)
@@ -148,6 +156,7 @@ def read_header_board_mo(file_bytes: bytes):
         return None, None
 
 def read_body_df(file_bytes: bytes, filename: str):
+    """Skip first 2 rows; only first 12 columns A-L."""
     ext = filename.lower().split(".")[-1]
     try:
         if ext in ("xls", "xlsx"):
@@ -168,22 +177,36 @@ def read_body_df(file_bytes: bytes, filename: str):
     return df
 
 # =========================================================
-# BOM INGEST (VERSIONED)
+# BOM INGEST (MASTER BOM, VERSIONED)
 # =========================================================
-def ingest_bom(conn: sqlite3.Connection, bom_bytes: bytes, bom_name: str) -> int:
+def ingest_master_bom(conn: sqlite3.Connection, bom_bytes: bytes, bom_name: str) -> int:
+    """
+    Master BOM:
+    - Component text in column A (index 0), component inside [ ]
+    - Cost in column J (index 9)
+    Reads ALL sheets.
+    Stores as new bom_version.
+    """
     xls = pd.ExcelFile(io.BytesIO(bom_bytes))
     items = []
 
     for sheet in xls.sheet_names:
         df = pd.read_excel(xls, sheet_name=sheet, header=None)
+
+        if df.shape[1] <= max(MASTER_BOM_COMP_COL_INDEX, MASTER_BOM_COST_COL_INDEX):
+            continue
+
         for i in range(len(df)):
-            comp = extract_component_from_bom_cell(df.iat[i, 0]) if df.shape[1] > 0 else None
+            comp_text = df.iat[i, MASTER_BOM_COMP_COL_INDEX]
+            comp = extract_component_from_text(comp_text)
             if not comp:
                 continue
-            raw_cost = df.iat[i, 10] if df.shape[1] > 10 else None
+
+            raw_cost = df.iat[i, MASTER_BOM_COST_COL_INDEX]
             cost = parse_cost(raw_cost)
             if pd.isna(cost):
                 continue
+
             items.append((str(comp).strip(), float(cost)))
 
     if not items:
@@ -196,7 +219,7 @@ def ingest_bom(conn: sqlite3.Connection, bom_bytes: bytes, bom_name: str) -> int
     )
     bom_id = cur.lastrowid
 
-    # Keep last cost per component within THIS upload
+    # Keep last cost per component in THIS upload
     tmp = {}
     for comp, cost in items:
         tmp[comp] = cost
@@ -217,9 +240,9 @@ def list_boms(conn: sqlite3.Connection) -> pd.DataFrame:
 def get_bom_lookup(conn: sqlite3.Connection, selected_bom_ids: list[int] | None) -> dict:
     """
     If selected_bom_ids is empty/None:
-      - Default behavior = latest cost per component across ALL BOMs
+      - Use latest cost per component across ALL BOM versions
     If selected_bom_ids provided:
-      - Use only those BOMs; if component appears multiple times, use newest bom_id inside that selection.
+      - Use only those BOM versions; newest bom_id wins per component.
     """
     if not selected_bom_ids:
         sql = """
@@ -254,8 +277,7 @@ def get_bom_lookup(conn: sqlite3.Connection, selected_bom_ids: list[int] | None)
 # LOG INGEST (EVENTS STORED)
 # =========================================================
 def ingest_logs(conn: sqlite3.Connection, uploads):
-    # At ingest time, we assign cost based on "default BOM behavior" (latest per component across all BOMs).
-    # Analysis-time can override costs by selecting BOM(s); we recompute costs then.
+    # Assign a cost at ingest time using default BOM behavior (latest across all BOM versions).
     bom_lookup = get_bom_lookup(conn, selected_bom_ids=None)
 
     skipped = []
@@ -376,7 +398,7 @@ def query_events(conn: sqlite3.Connection,
 
     df = pd.read_sql_query(sql, conn, params=params)
 
-    # Recompute cost using the selected BOM(s) for THIS analysis run
+    # Recompute costs for THIS analysis run using selected BOM(s)
     if df.empty:
         df["UnitCost"] = []
         df["Cost"] = []
@@ -409,8 +431,7 @@ def query_boards_run_by_board(conn: sqlite3.Connection,
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " GROUP BY board_name"
-    df = pd.read_sql_query(sql, conn, params=params)
-    return df
+    return pd.read_sql_query(sql, conn, params=params)
 
 # =========================================================
 # DERIVED VIEWS
@@ -465,7 +486,7 @@ with st.expander("📚 View uploaded Logs and BOMs"):
     cA, cB = st.columns(2)
 
     with cA:
-        st.subheader("BOMs uploaded")
+        st.subheader("Master BOM versions uploaded")
         boms_df = list_boms(conn)
         if boms_df.empty:
             st.info("No BOMs stored yet.")
@@ -488,21 +509,32 @@ with st.expander("📦 Data Store (upload once, reuse later)", expanded=True):
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("Upload / Update BOM (stored as version)")
-        bom_up = st.file_uploader("BOM Excel (all sheets read)", type=["xls", "xlsx"], key="bom_up")
-        bom_name = st.text_input("BOM name/label (e.g. BoardRevA, Jan-2026)", value="", key="bom_name")
-        if st.button("Save BOM to Database", type="secondary"):
+        st.subheader("Upload Master BOM (stored as version)")
+        bom_up = st.file_uploader(
+            "Master BOM Excel (all sheets read). Component in column A as [COMP], Cost in column J.",
+            type=["xls", "xlsx"],
+            key="bom_up"
+        )
+        bom_name = st.text_input("BOM name/label (e.g. Master BOM Feb-2026)", value="", key="bom_name")
+        if st.button("Save Master BOM to Database", type="secondary"):
             if not bom_up:
-                st.warning("Upload a BOM file first.")
+                st.warning("Upload a Master BOM file first.")
             else:
                 label = bom_name.strip() if bom_name.strip() else bom_up.name
-                n = ingest_bom(conn, bom_up.getvalue(), label)
-                st.success(f"BOM stored as a new version. Components loaded: {n}")
+                n = ingest_master_bom(conn, bom_up.getvalue(), label)
+                if n == 0:
+                    st.error("No BOM items were loaded. Check: component in [ ] in column A and cost in column J.")
+                else:
+                    st.success(f"Master BOM stored as a new version. Components loaded: {n}")
 
     with col2:
         st.subheader("Ingest Log Files")
-        logs_up = st.file_uploader("Upload log files (CSV/XLS/XLSX)", type=["csv","xls","xlsx"],
-                                   accept_multiple_files=True, key="logs_up")
+        logs_up = st.file_uploader(
+            "Upload log files (CSV/XLS/XLSX)",
+            type=["csv","xls","xlsx"],
+            accept_multiple_files=True,
+            key="logs_up"
+        )
         if st.button("Ingest Logs into Database", type="secondary"):
             if not logs_up:
                 st.warning("Upload log files first.")
@@ -564,7 +596,7 @@ if not boms_df.empty:
 f0, f1, f2, f3, f4 = st.columns([1.2, 1, 1, 1, 1])
 with f0:
     selected_boms_labels = st.multiselect(
-        "BOM(s) to use for analysis (leave blank = default)",
+        "Master BOM version(s) to use for analysis (leave blank = latest version per component)",
         options=bom_labels,
         default=[],
         key="selected_boms"
@@ -617,7 +649,7 @@ view = st.selectbox(
 )
 
 if not st.session_state.has_results:
-    st.info("Ingest logs + BOM once (above), then set filters and click **Run Query**.")
+    st.info("Upload Master BOM + ingest logs (once), then set filters and click **Run Query**.")
     st.stop()
 
 events_df = st.session_state.events_df.copy()
@@ -673,31 +705,23 @@ elif view == "Board Loss Components":
             .reset_index()
         )
 
-        # Merge boards run per board (within filtered selection window)
         comp_loss = comp_loss.merge(boards_run_by_board, on="Board", how="left")
         comp_loss["BoardsRun"] = comp_loss["BoardsRun"].fillna(0).astype(int)
 
-        # Two useful % metrics:
-        # 1) Period % of Board Value (over this selection window)
         comp_loss["Period % of Board Value"] = (
-            (comp_loss["Cost"] / board_value) * 100
-            if board_value else np.nan
+            (comp_loss["Cost"] / board_value) * 100 if board_value else np.nan
         )
 
-        # 2) Avg % of Board Value per Board (your requested metric)
         comp_loss["Avg % of Board Value per Board"] = np.where(
             (board_value > 0) & (comp_loss["BoardsRun"] > 0),
             (comp_loss["Cost"] / (board_value * comp_loss["BoardsRun"])) * 100,
             np.nan
         )
 
-        # Also useful: share of the board's total loss during the period
         board_total = comp_loss.groupby("Board")["Cost"].transform("sum")
         comp_loss["% of Board’s Total Loss"] = np.where(board_total > 0, (comp_loss["Cost"] / board_total) * 100, 0.0)
 
         comp_loss = comp_loss.sort_values(["Board", "Cost"], ascending=[True, False])
-
-        # Nice column order
         comp_loss = comp_loss[
             ["Board","BoardsRun","Component","Description","Spits","UnitCost","Cost",
              "Period % of Board Value","Avg % of Board Value per Board","% of Board’s Total Loss"]
