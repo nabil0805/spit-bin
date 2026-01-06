@@ -9,7 +9,7 @@ from pandas.errors import EmptyDataError
 # CONFIG
 # ---------------------------------------------------------
 st.set_page_config(page_title="SMT Spit Analytics", layout="wide")
-REJECT_CODES = {2, 3, 4, 5, 6, 7}
+REJECT_CODES = {2, 3, 4, 5, 7}
 
 # ---------------------------------------------------------
 # HELPERS
@@ -329,5 +329,6 @@ elif view == "Board Loss Components":
             (comp_loss["Cost"] / board_value) * 100 if board_value else np.nan
         )
         st.dataframe(comp_loss, use_container_width=True)
+
 
 
