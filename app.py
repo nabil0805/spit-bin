@@ -4,7 +4,6 @@ import numpy as np
 import re
 import io
 from pandas.errors import EmptyDataError
-import matplotlib.pyplot as plt
 
 # ---------------------------------------------------------
 # CONFIG
@@ -18,7 +17,7 @@ REJECT_CODES = {2, 3, 4, 5, 7}
 def parse_cost(v):
     if pd.isna(v):
         return np.nan
-    if isinstance(v, (int, float)):
+    if isinstance(v, (int, float, np.number)):
         return float(v)
     s = str(v).replace(",", "")
     s = re.sub(r"[^\d\.\-]", "", s)
@@ -34,7 +33,11 @@ def extract_component(text):
     return m.group(1).strip() if m else None
 
 def safe_read_csv(bytes_data, **kwargs):
-    """Try UTF-8, then Latin-1. Return df or raise."""
+    """
+    Robust CSV read:
+    - try utf-8 then latin-1
+    - lets EmptyDataError bubble up so caller can handle it
+    """
     try:
         return pd.read_csv(io.BytesIO(bytes_data), encoding="utf-8", **kwargs)
     except UnicodeDecodeError:
@@ -55,7 +58,7 @@ def load_bom(bom_bytes):
                 continue
             cost = parse_cost(df.iat[i, 10]) if df.shape[1] > 10 else np.nan
             if not pd.isna(cost):
-                records.append({"Component": comp, "Unit Cost": float(cost)})
+                records.append({"Component": str(comp).strip(), "Unit Cost": float(cost)})
 
     if not records:
         return {}
@@ -68,62 +71,70 @@ def load_bom(bom_bytes):
     )
 
 # ---------------------------------------------------------
-# READ LOG FILES (ROBUST)
+# READ LOG FILES (HARDENED AGAINST EMPTY/ODD FILES)
 # ---------------------------------------------------------
 def read_logs(log_files, cost_lookup):
     events = []
     files = []
-
     skipped = []
 
-    for f in log_files:
-        name = f.name
-        data = f.getvalue()
+    for up in log_files:
+        name = up.name
+        data = up.getvalue()
 
         if data is None or len(data) == 0:
-            skipped.append((name, "empty file (0 bytes)"))
+            skipped.append((name, "Empty file (0 bytes)"))
             continue
 
-        # ---------- HEADER ----------
+        # -------- HEADER (row 1) --------
         try:
-            # Read first row; excel first, then csv fallback
             try:
                 header = pd.read_excel(io.BytesIO(data), nrows=1, header=None)
             except Exception:
                 header = safe_read_csv(data, nrows=1, header=None)
         except EmptyDataError:
-            skipped.append((name, "empty header"))
+            skipped.append((name, "Empty header"))
             continue
         except Exception as e:
-            skipped.append((name, f"header read failed: {e}"))
+            skipped.append((name, f"Header read failed: {type(e).__name__}"))
             continue
 
-        # Guard for short/invalid header rows
+        # validate header has required cells (B1, D1, I1, L1)
         try:
-            board = str(header.iloc[0, 1]).strip()    # B1
-            mo = str(header.iloc[0, 3]).strip()       # D1
-            date = str(header.iloc[0, 8]).strip()     # I1
-            machine = str(header.iloc[0, 11]).strip() # L1
+            board = str(header.iloc[0, 1]).strip()     # B1
+            mo = str(header.iloc[0, 3]).strip()        # D1
+            date = str(header.iloc[0, 8]).strip()      # I1
+            machine = str(header.iloc[0, 11]).strip()  # L1
         except Exception:
-            skipped.append((name, "header missing expected columns (B1/D1/I1/L1)"))
+            skipped.append((name, "Header missing required cells (B1/D1/I1/L1)"))
             continue
 
-        # ---------- BODY ----------
+        # -------- BODY (skip first 2 rows, first 12 cols) --------
         try:
-            # excel first, then csv fallback
             try:
                 df = pd.read_excel(io.BytesIO(data), skiprows=2, header=None, usecols=range(12))
             except Exception:
                 df = safe_read_csv(data, skiprows=2, header=None, usecols=range(12))
         except EmptyDataError:
-            skipped.append((name, "no data rows after skipping first 2 rows"))
+            skipped.append((name, "No data after skipping first 2 rows"))
             continue
         except Exception as e:
-            skipped.append((name, f"data read failed: {e}"))
+            skipped.append((name, f"Data read failed: {type(e).__name__}"))
             continue
 
         if df is None or df.empty:
-            skipped.append((name, "dataframe empty after read"))
+            skipped.append((name, "Dataframe empty after read"))
+            continue
+
+        # ensure 12 cols exist even if pandas returned fewer for some reason
+        try:
+            df = df.iloc[:, :12]
+        except Exception:
+            skipped.append((name, "Could not slice first 12 columns"))
+            continue
+
+        if df.shape[1] < 12:
+            skipped.append((name, f"Only {df.shape[1]} columns found (need 12)"))
             continue
 
         df.columns = list("ABCDEFGHIJKL")
@@ -132,13 +143,13 @@ def read_logs(log_files, cost_lookup):
         for _, r in df.iterrows():
             try:
                 if int(r["L"]) in REJECT_CODES:
-                    c = str(r["B"]).strip()
-                    cost = float(cost_lookup.get(c, 0.0))
+                    comp = str(r["B"]).strip()
+                    cost = float(cost_lookup.get(comp, 0.0))
                     spit_count += 1
                     events.append({
-                        "Component": c,
-                        "Description": str(r["C"]),
-                        "Location": str(r["D"]),
+                        "Component": comp,
+                        "Description": str(r["C"]).strip(),
+                        "Location": str(r["D"]).strip(),
                         "Board": board,
                         "MO": mo,
                         "Date": date,
@@ -148,7 +159,7 @@ def read_logs(log_files, cost_lookup):
                     })
             except Exception:
                 # ignore bad rows
-                pass
+                continue
 
         files.append({"File": name, "Board": board, "MO": mo, "Spits": spit_count})
 
@@ -181,18 +192,17 @@ run = st.button("Run Analysis", type="primary")
 
 if run and log_files and bom_file:
     cost_lookup = load_bom(bom_file.getvalue())
-
     events_df, files_df, skipped = read_logs(log_files, cost_lookup)
 
     if skipped:
-        with st.expander(f"Skipped files ({len(skipped)})", expanded=False):
-            st.write(pd.DataFrame(skipped, columns=["File", "Reason"]))
+        with st.expander(f"Skipped files ({len(skipped)})", expanded=True):
+            st.dataframe(pd.DataFrame(skipped, columns=["File", "Reason"]), use_container_width=True)
 
     if len(files_df) == 0:
-        st.error("No valid log files were processed. Check the 'Skipped files' list above.")
+        st.error("No valid log files were processed. Please check the skipped files list.")
         st.stop()
 
-    st.success(f"Analysis complete. Boards processed: {len(files_df)}. Spit events: {len(events_df)}.")
+    st.success(f"Done. Boards processed: {len(files_df)} | Spit events: {len(events_df)}")
 
     view = st.selectbox(
         "Select View",
@@ -208,7 +218,6 @@ if run and log_files and bom_file:
         ]
     )
 
-    # -------------------------
     if view == "Summary":
         if len(events_df) == 0:
             st.info("No spit events found in the selected logs.")
@@ -227,11 +236,9 @@ if run and log_files and bom_file:
             )
             st.dataframe(summary, use_container_width=True)
 
-    # -------------------------
     elif view == "Spit Events":
         st.dataframe(events_df, use_container_width=True)
 
-    # -------------------------
     elif view == "Pareto (Cost)":
         if len(events_df) == 0:
             st.info("No spit events found.")
@@ -239,14 +246,12 @@ if run and log_files and bom_file:
             pareto = events_df.groupby("Component")["Cost"].sum().sort_values(ascending=False)
             st.bar_chart(pareto)
 
-    # -------------------------
     elif view == "Repeated Locations":
         if len(events_df) == 0:
             st.info("No spit events found.")
         else:
             rep = (
-                events_df
-                .groupby(["Component", "Location", "Machine"])
+                events_df.groupby(["Component", "Location", "Machine"])
                 .size()
                 .reset_index(name="Spits")
                 .query("Spits > 1")
@@ -254,7 +259,6 @@ if run and log_files and bom_file:
             )
             st.dataframe(rep, use_container_width=True)
 
-    # -------------------------
     elif view == "Yield Loss":
         total_boards = len(files_df)
         total_cost = float(events_df["Cost"].sum()) if len(events_df) else 0.0
@@ -262,15 +266,6 @@ if run and log_files and bom_file:
         st.metric("Total Cost Loss", round(total_cost, 2))
         st.metric("Avg Cost / Board", round(total_cost / total_boards, 2) if total_boards else 0)
 
-        st.subheader("MO-wise")
-        mo_view = files_df.groupby("MO").agg(Boards=("File", "count"), Spits=("Spits", "sum")).reset_index()
-        st.dataframe(mo_view, use_container_width=True)
-
-        st.subheader("Board-wise")
-        b_view = files_df.groupby("Board").agg(Boards=("File", "count"), Spits=("Spits", "sum")).reset_index()
-        st.dataframe(b_view, use_container_width=True)
-
-    # -------------------------
     elif view == "Missing BOM Costs":
         if len(events_df) == 0:
             st.info("No spit events found.")
@@ -283,34 +278,29 @@ if run and log_files and bom_file:
             )
             st.dataframe(missing, use_container_width=True)
 
-    # -------------------------
     elif view == "Board Loss %":
         if len(events_df) == 0:
             st.info("No spit events found.")
         else:
             board_loss = events_df.groupby("Board")["Cost"].sum().reset_index()
             board_loss["Loss % of Board Value"] = (
-                (board_loss["Cost"] / board_value) * 100
-                if board_value else np.nan
+                (board_loss["Cost"] / board_value) * 100 if board_value else np.nan
             )
             st.dataframe(board_loss, use_container_width=True)
 
-    # -------------------------
     elif view == "Board Loss Components":
         if len(events_df) == 0:
             st.info("No spit events found.")
         else:
             comp_loss = (
-                events_df
-                .groupby(["Board", "Component"])
+                events_df.groupby(["Board", "Component"])
                 .agg(Spits=("Component", "count"), Cost=("Cost", "sum"))
                 .reset_index()
+                .sort_values(["Board", "Cost"], ascending=[True, False])
             )
             comp_loss["Loss % of Board Value"] = (
-                (comp_loss["Cost"] / board_value) * 100
-                if board_value else np.nan
+                (comp_loss["Cost"] / board_value) * 100 if board_value else np.nan
             )
-            comp_loss = comp_loss.sort_values(["Board", "Cost"], ascending=[True, False])
             st.dataframe(comp_loss, use_container_width=True)
 
 else:
