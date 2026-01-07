@@ -9,6 +9,11 @@ import hashlib
 from datetime import datetime, date, time
 from pandas.errors import EmptyDataError
 
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.chart import BarChart, Reference
+
 # =========================================================
 # PERSISTENT DATABASE (STREAMLIT CLOUD SAFE)
 # =========================================================
@@ -23,7 +28,7 @@ st.set_page_config(page_title="SMT Spit Analytics", layout="wide")
 
 REJECT_CODES = {2, 3, 4, 5, 7}
 
-# Line setup (board counting model)
+# Board counting model
 LINE1_MACHINES = {"EPS16"}
 LINE2_MACHINES = {"IINEO682", "IIN2-053-2", "IIN2-053-1"}
 LINE2_DIVISOR = 3  # line2 boards estimated as logs/3
@@ -44,8 +49,11 @@ def db_connect():
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
+def _table_has_column(conn: sqlite3.Connection, table: str, col: str) -> bool:
+    cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(c[1] == col for c in cols)
+
 def db_init(conn: sqlite3.Connection):
-    # Versioned BOMs
     conn.execute("""
     CREATE TABLE IF NOT EXISTS bom_versions (
         bom_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,18 +73,18 @@ def db_init(conn: sqlite3.Connection):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bom_items_component ON bom_items(component)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bom_items_bomid ON bom_items(bom_id)")
 
-    # Logs + Events
     conn.execute("""
     CREATE TABLE IF NOT EXISTS logs (
         file_hash TEXT PRIMARY KEY,
         filename TEXT NOT NULL,
-        file_dt TEXT,          -- ISO datetime (derived from filename)
-        machine TEXT,          -- derived from filename
-        board_name TEXT,       -- from B1
-        mo TEXT,               -- from D1
+        file_dt TEXT,
+        machine TEXT,
+        board_name TEXT,
+        mo TEXT,
         ingested_at TEXT NOT NULL
     )
     """)
+
     conn.execute("""
     CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,15 +97,20 @@ def db_init(conn: sqlite3.Connection):
         file_dt TEXT,
         machine TEXT,
         unit_cost REAL,
-        cost REAL,
-        FOREIGN KEY(file_hash) REFERENCES logs(file_hash) ON DELETE CASCADE
+        cost REAL
     )
     """)
+
+    # ---- MIGRATION: add reject_code column if missing
+    if not _table_has_column(conn, "events", "reject_code"):
+        conn.execute("ALTER TABLE events ADD COLUMN reject_code INTEGER")
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_dt ON events(file_dt)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_board ON events(board_name)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_mo ON events(mo)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_machine ON events(machine)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_comp ON events(component)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_reject_code ON events(reject_code)")
     conn.commit()
 
 def sha256_bytes(b: bytes) -> str:
@@ -224,7 +237,6 @@ def ingest_master_bom(conn: sqlite3.Connection, bom_bytes: bytes, bom_name: str)
     )
     bom_id = cur.lastrowid
 
-    # last wins per component within this version
     tmp = {}
     for comp, cost in items:
         tmp[comp] = cost
@@ -312,20 +324,27 @@ def ingest_logs(conn: sqlite3.Connection, uploads):
         ev_rows = []
         for _, r in df.iterrows():
             try:
-                if int(r["L"]) in REJECT_CODES:
+                code = int(r["L"])
+            except Exception:
+                continue
+
+            if code in REJECT_CODES:
+                try:
                     comp = str(r["B"]).strip()
                     desc = str(r["C"]).strip()
                     loc = str(r["D"]).strip()
                     cost = float(bom_lookup.get(comp, 0.0))
-                    ev_rows.append((file_hash, comp, desc, loc, board, mo, dt_iso, machine, cost, cost))
-            except Exception:
-                continue
+                    ev_rows.append((file_hash, comp, desc, loc, board, mo, dt_iso, machine, cost, cost, code))
+                except Exception:
+                    continue
 
         if ev_rows:
             conn.executemany(
                 """
-                INSERT INTO events(file_hash, component, description, location, board_name, mo, file_dt, machine, unit_cost, cost)
-                VALUES (?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO events(
+                    file_hash, component, description, location, board_name, mo, file_dt, machine, unit_cost, cost, reject_code
+                )
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 ev_rows
             )
@@ -380,8 +399,6 @@ def estimate_total_boards(conn, dt_start, dt_end, boards, mos, machines) -> floa
 
     line1_logs = float(df.loc[df["machine"].isin(LINE1_MACHINES), "n"].sum())
     line2_logs = float(df.loc[df["machine"].isin(LINE2_MACHINES), "n"].sum())
-
-    # treat unknown machines as 1-to-1 unless filtered explicitly
     other_logs = float(df.loc[~df["machine"].isin(LINE1_MACHINES.union(LINE2_MACHINES)), "n"].sum())
 
     return line1_logs + (line2_logs / LINE2_DIVISOR) + other_logs
@@ -424,7 +441,7 @@ def machine_log_breakdown(conn, dt_start, dt_end, boards, mos, machines) -> pd.D
     return pd.read_sql_query(sql, conn, params=params)
 
 # =========================================================
-# EVENTS QUERY
+# EVENTS QUERY (includes Reject Code)
 # =========================================================
 def query_events(conn, dt_start, dt_end, boards, mos, machines, components, bom_lookup):
     where, params = _build_where(dt_start, dt_end, boards, mos, machines, components)
@@ -436,7 +453,8 @@ def query_events(conn, dt_start, dt_end, boards, mos, machines, components, bom_
       board_name AS Board,
       mo AS MO,
       file_dt AS FileDateTime,
-      machine AS Machine
+      machine AS Machine,
+      reject_code AS RejectCode
     FROM events
     """
     if where:
@@ -454,21 +472,44 @@ def query_events(conn, dt_start, dt_end, boards, mos, machines, components, bom_
     return df
 
 # =========================================================
-# DERIVED VIEWS
+# DERIVED VIEWS (Summary includes Reject Codes breakdown)
 # =========================================================
+def _format_reject_codes(series: pd.Series) -> str:
+    """
+    series contains reject codes (ints or NaN).
+    Returns: "5x C7, 5x C2, 10x C3" (sorted by count desc then code asc)
+    """
+    s = series.dropna()
+    if s.empty:
+        return ""
+    try:
+        s = s.astype(int)
+    except Exception:
+        # if weird strings exist, coerce where possible
+        s = pd.to_numeric(s, errors="coerce").dropna().astype(int)
+        if s.empty:
+            return ""
+    vc = s.value_counts()
+    parts = []
+    for code, cnt in vc.sort_values(ascending=False).items():
+        parts.append(f"{int(cnt)}x C{int(code)}")
+    return ", ".join(parts)
+
 def make_summary(events_df):
     if events_df.empty:
-        return pd.DataFrame(columns=["Component","Description","Machine","Spits","UnitCost","TotalCost"])
+        return pd.DataFrame(columns=["Component","Description","Machine","Spits","Reject Codes","UnitCost","TotalCost"])
     return (
         events_df.groupby("Component")
         .agg(
             Description=("Description", lambda x: x.mode().iloc[0] if len(x.mode()) else x.iloc[0]),
             Machine=("Machine", lambda x: x.mode().iloc[0] if len(x.mode()) else x.iloc[0]),
             Spits=("Component", "count"),
+            RejectCodes=("RejectCode", _format_reject_codes),
             UnitCost=("UnitCost", "max"),
             TotalCost=("Cost", "sum"),
         )
         .reset_index()
+        .rename(columns={"RejectCodes": "Reject Codes"})
         .sort_values("TotalCost", ascending=False)
     )
 
@@ -534,12 +575,164 @@ def make_board_loss_components(events_df, boards_run_by_board, board_value):
     return comp_loss.sort_values(["Board", "Cost"], ascending=[True, False])
 
 # =========================================================
+# EXCEL EXPORT
+# =========================================================
+def _fit_columns(ws, max_width=60):
+    for col_cells in ws.columns:
+        length = 0
+        col_letter = col_cells[0].column_letter
+        for c in col_cells:
+            if c.value is None:
+                continue
+            length = max(length, len(str(c.value)))
+        ws.column_dimensions[col_letter].width = min(max(10, length + 2), max_width)
+
+def _add_table(ws, name, ref):
+    tab = Table(displayName=name, ref=ref)
+    tab.tableStyleInfo = TableStyleInfo(
+        name="TableStyleMedium9",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False,
+    )
+    ws.add_table(tab)
+
+def build_excel_report(
+    events_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    pareto_df: pd.DataFrame,
+    repeated_df: pd.DataFrame,
+    yield_df: pd.DataFrame,
+    missing_df: pd.DataFrame,
+    board_loss_df: pd.DataFrame,
+    board_loss_components_df: pd.DataFrame
+) -> bytes:
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    # ---- Summary
+    ws = wb.create_sheet("Summary")
+    for r in dataframe_to_rows(summary_df, index=False, header=True):
+        ws.append(r)
+    if ws.max_row >= 2:
+        _add_table(ws, "SummaryTable", f"A1:G{ws.max_row}")
+    _fit_columns(ws)
+
+    # ---- Spit Events
+    ws = wb.create_sheet("Spit Events")
+    for r in dataframe_to_rows(events_df, index=False, header=True):
+        ws.append(r)
+    if ws.max_row >= 2:
+        # Now includes RejectCode so width increases
+        _add_table(ws, "SpitEventsTable", f"A1:J{ws.max_row}")
+    _fit_columns(ws)
+
+    # ---- Pareto
+    ws = wb.create_sheet("Pareto (Cost)")
+    ws.append(["Component", "TotalCost"])
+    for _, row in pareto_df.iterrows():
+        ws.append([row["Component"], float(row["TotalCost"])])
+    _fit_columns(ws)
+
+    if len(pareto_df) > 0:
+        chart = BarChart()
+        chart.title = "Cost-Based Pareto (Top Offenders)"
+        chart.y_axis.title = "Total Cost Loss"
+        chart.x_axis.title = "Component"
+        data = Reference(ws, min_col=2, min_row=1, max_row=len(pareto_df) + 1)
+        cats = Reference(ws, min_col=1, min_row=2, max_row=len(pareto_df) + 1)
+        chart.add_data(data, titles_from_data=True)
+        chart.set_categories(cats)
+        chart.height = 12
+        chart.width = 28
+        ws.add_chart(chart, "D2")
+
+    # ---- Repeated Locations
+    ws = wb.create_sheet("Repeated Locations")
+    for r in dataframe_to_rows(repeated_df, index=False, header=True):
+        ws.append(r)
+    if ws.max_row >= 2 and repeated_df.shape[1] > 0:
+        _add_table(ws, "RepeatedLocationsTable", f"A1:F{ws.max_row}")
+    _fit_columns(ws)
+
+    # ---- Yield Loss
+    ws = wb.create_sheet("Yield Loss")
+    for r in dataframe_to_rows(yield_df, index=False, header=True):
+        ws.append(r)
+    _fit_columns(ws)
+
+    # ---- Missing BOM Costs
+    ws = wb.create_sheet("Missing BOM Costs")
+    for r in dataframe_to_rows(missing_df, index=False, header=True):
+        ws.append(r)
+    if ws.max_row >= 2 and missing_df.shape[1] > 0:
+        _add_table(ws, "MissingCostTable", f"A1:B{ws.max_row}")
+    _fit_columns(ws)
+
+    # ---- Board Loss %
+    ws = wb.create_sheet("Board Loss %")
+    for r in dataframe_to_rows(board_loss_df, index=False, header=True):
+        ws.append(r)
+    if ws.max_row >= 2 and board_loss_df.shape[1] > 0:
+        _add_table(ws, "BoardLossTable", f"A1:C{ws.max_row}")
+    _fit_columns(ws)
+
+    # ---- Board Loss Components
+    ws = wb.create_sheet("Board Loss Components")
+    for r in dataframe_to_rows(board_loss_components_df, index=False, header=True):
+        ws.append(r)
+    if ws.max_row >= 2 and board_loss_components_df.shape[1] > 0:
+        _add_table(ws, "BoardLossComponentsTable", f"A1:J{ws.max_row}")
+    _fit_columns(ws)
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio.getvalue()
+
+# =========================================================
+# RESET DB (ADMIN)
+# =========================================================
+def reset_database():
+    try:
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+    except Exception as e:
+        return False, str(e)
+    return True, None
+
+# =========================================================
 # APP UI
 # =========================================================
 conn = db_connect()
 db_init(conn)
 
-st.title("SMT Spit Analytics (Full)")
+st.title("SMT Spit Analytics (Full, Stable)")
+
+# ---- Admin tools (Reset DB)
+with st.expander("🔐 Admin Tools (Reset Database)"):
+    admin_pw = st.text_input("Admin password", type="password")
+    secret_pw = st.secrets.get("ADMIN_PASSWORD", None)
+
+    if secret_pw is None:
+        st.warning("Reset disabled: ADMIN_PASSWORD is not set in Streamlit Secrets.")
+    else:
+        st.caption("This deletes the saved database (BOMs + logs + events). Use carefully.")
+        confirm = st.checkbox("I understand this will DELETE all saved data.")
+        if st.button("RESET DATABASE", type="secondary"):
+            if not confirm:
+                st.error("Please tick the confirmation checkbox first.")
+            elif admin_pw != secret_pw:
+                st.error("Incorrect admin password.")
+            else:
+                ok, err = reset_database()
+                if ok:
+                    st.success("Database deleted. The app will rebuild tables on next run.")
+                    st.session_state.clear()
+                    st.rerun()
+                else:
+                    st.error(f"Reset failed: {err}")
 
 # ---- View uploaded files and BOMs
 with st.expander("📚 View uploaded Logs and Master BOM versions"):
@@ -563,6 +756,7 @@ with st.expander("📚 View uploaded Logs and Master BOM versions"):
         else:
             st.dataframe(logs_df, use_container_width=True, height=240)
 
+# ---- Upload/Ingest
 with st.expander("📦 Data Store (upload once, reused later)", expanded=True):
     col1, col2 = st.columns(2)
 
@@ -574,6 +768,7 @@ with st.expander("📦 Data Store (upload once, reused later)", expanded=True):
             key="bom_up"
         )
         bom_name = st.text_input("BOM name/label (e.g. Master BOM Jan-2026)", value="", key="bom_name")
+
         if st.button("Save Master BOM to Database", type="secondary"):
             if not bom_up:
                 st.warning("Upload a Master BOM file first.")
@@ -652,7 +847,7 @@ if not boms_df.empty:
 f0, f1, f2, f3, f4 = st.columns([1.2, 1, 1, 1, 1])
 with f0:
     selected_boms_labels = st.multiselect(
-        "Master BOM version(s) to use for analysis (blank = latest version per component)",
+        "Master BOM version(s) to use for analysis (blank = latest per component)",
         options=bom_labels,
         default=[],
         key="selected_boms"
@@ -684,10 +879,37 @@ if run_query:
 
     m_breakdown = machine_log_breakdown(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel)
 
-    st.session_state.events_df = events_df
-    st.session_state.total_boards_est = float(total_boards_est)
-    st.session_state.boards_run_by_board = boards_run_by_board
-    st.session_state.machine_breakdown = m_breakdown
+    summary_df = make_summary(events_df)
+    repeated_df = make_repeated_locations(events_df)
+    missing_df = make_missing_costs(events_df)
+    board_loss_df = make_board_loss(events_df, board_value)
+    board_loss_components_df = make_board_loss_components(events_df, boards_run_by_board, board_value)
+
+    pareto_df = summary_df[["Component", "TotalCost"]].copy()
+    pareto_df = pareto_df.sort_values("TotalCost", ascending=False).head(30)
+
+    total_cost = float(events_df["Cost"].sum()) if not events_df.empty else 0.0
+    yield_df = pd.DataFrame([
+        ["Estimated Boards Run", round(float(total_boards_est), 3)],
+        ["Total Cost Loss", round(total_cost, 2)],
+        ["Avg Cost Loss / Board", round((total_cost / total_boards_est), 2) if total_boards_est else 0.0],
+        ["Board Value (input)", float(board_value)],
+    ], columns=["Metric", "Value"])
+
+    st.session_state.payload = {
+        "events_df": events_df,
+        "summary_df": summary_df,
+        "pareto_df": pareto_df,
+        "repeated_df": repeated_df,
+        "missing_df": missing_df,
+        "board_loss_df": board_loss_df,
+        "board_loss_components_df": board_loss_components_df,
+        "yield_df": yield_df,
+        "machine_breakdown": m_breakdown,
+        "total_boards_est": float(total_boards_est),
+        "total_cost": float(total_cost),
+        "board_value": float(board_value),
+    }
     st.session_state.has_results = True
 
 # View selector
@@ -710,14 +932,40 @@ if not st.session_state.has_results:
     st.info("Upload BOM + ingest logs (once), then set filters and click **Run Query**.")
     st.stop()
 
-events_df = st.session_state.events_df.copy()
-total_boards_est = float(st.session_state.total_boards_est)
-boards_run_by_board = st.session_state.boards_run_by_board.copy()
-machine_breakdown_df = st.session_state.machine_breakdown.copy()
+payload = st.session_state.payload
+events_df = payload["events_df"]
+summary_df = payload["summary_df"]
+pareto_df = payload["pareto_df"]
+repeated_df = payload["repeated_df"]
+missing_df = payload["missing_df"]
+board_loss_df = payload["board_loss_df"]
+board_loss_components_df = payload["board_loss_components_df"]
+yield_df = payload["yield_df"]
+machine_breakdown = payload["machine_breakdown"]
+
+# ---- Excel Export button
+with st.expander("⬇️ Export to Excel"):
+    report_bytes = build_excel_report(
+        events_df=events_df,
+        summary_df=summary_df,
+        pareto_df=pareto_df,
+        repeated_df=repeated_df,
+        yield_df=yield_df,
+        missing_df=missing_df,
+        board_loss_df=board_loss_df,
+        board_loss_components_df=board_loss_components_df
+    )
+    fname = f"smt_spit_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    st.download_button(
+        "Download Excel Report",
+        data=report_bytes,
+        file_name=fname,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 # Views
 if view == "Summary":
-    st.dataframe(make_summary(events_df), use_container_width=True)
+    st.dataframe(summary_df, use_container_width=True)
 
 elif view == "Spit Events":
     st.dataframe(events_df, use_container_width=True)
@@ -726,34 +974,21 @@ elif view == "Pareto (Cost)":
     if events_df.empty:
         st.info("No events in this selection.")
     else:
-        st.bar_chart(events_df.groupby("Component")["Cost"].sum().sort_values(ascending=False))
+        st.bar_chart(summary_df.set_index("Component")["TotalCost"].head(30))
 
 elif view == "Repeated Locations":
-    st.dataframe(make_repeated_locations(events_df), use_container_width=True)
+    st.dataframe(repeated_df, use_container_width=True)
 
 elif view == "Yield Loss":
-    total_cost = float(events_df["Cost"].sum()) if not events_df.empty else 0.0
-    st.metric("Estimated Boards Run", round(total_boards_est, 2))
-    st.metric("Total Cost Loss", round(total_cost, 2))
-    st.metric("Avg Cost / Board (Estimated)", round(total_cost / total_boards_est, 2) if total_boards_est else 0.0)
-
-    st.subheader("Machine log breakdown (for board estimation)")
-    st.dataframe(machine_breakdown_df, use_container_width=True)
-
-    st.subheader("Boards Run breakdown by board (Estimated)")
-    if boards_run_by_board.empty:
-        st.info("No board breakdown for this selection.")
-    else:
-        st.dataframe(boards_run_by_board.sort_values("BoardsRun", ascending=False), use_container_width=True)
+    st.dataframe(yield_df, use_container_width=True)
+    st.subheader("Machine log breakdown (used for board estimation)")
+    st.dataframe(machine_breakdown, use_container_width=True)
 
 elif view == "Missing BOM Costs":
-    st.dataframe(make_missing_costs(events_df), use_container_width=True)
+    st.dataframe(missing_df, use_container_width=True)
 
 elif view == "Board Loss %":
-    st.dataframe(make_board_loss(events_df, board_value), use_container_width=True)
+    st.dataframe(board_loss_df, use_container_width=True)
 
 elif view == "Board Loss Components":
-    out = make_board_loss_components(events_df, boards_run_by_board, board_value)
-    st.dataframe(out, use_container_width=True)
-
-
+    st.dataframe(board_loss_components_df, use_container_width=True)
