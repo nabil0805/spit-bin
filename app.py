@@ -756,3 +756,4 @@ elif view == "Board Loss Components":
     out = make_board_loss_components(events_df, boards_run_by_board, board_value)
     st.dataframe(out, use_container_width=True)
 
+
