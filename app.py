@@ -26,7 +26,7 @@ DB_PATH = os.path.join(DB_DIR, "smt_spit.db")
 # =========================================================
 st.set_page_config(page_title="SMT Spit Analytics", layout="wide")
 
-REJECT_CODES = {2, 3, 4, 5, 7}
+REJECT_CODES = {2, 3, 4, 5, 6, 7}
 
 # Board counting model
 LINE1_MACHINES = {"EPS16"}
@@ -992,3 +992,4 @@ elif view == "Board Loss %":
 
 elif view == "Board Loss Components":
     st.dataframe(board_loss_components_df, use_container_width=True)
+
