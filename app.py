@@ -6,6 +6,7 @@ import os
 import io
 import re
 import hashlib
+import json
 from datetime import datetime, date, time
 from pandas.errors import EmptyDataError
 
@@ -13,6 +14,12 @@ from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.chart import BarChart, Reference
+
+# Optional (only needed for Chatbot view)
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
 # =========================================================
 # PERSISTENT DATABASE (STREAMLIT CLOUD SAFE)
@@ -105,12 +112,21 @@ def db_init(conn: sqlite3.Connection):
     if not _table_has_column(conn, "events", "reject_code"):
         conn.execute("ALTER TABLE events ADD COLUMN reject_code INTEGER")
 
+    # ---- MIGRATION: add feeder_no / slot_no columns if missing (H, I)
+    if not _table_has_column(conn, "events", "feeder_no"):
+        conn.execute("ALTER TABLE events ADD COLUMN feeder_no TEXT")
+    if not _table_has_column(conn, "events", "slot_no"):
+        conn.execute("ALTER TABLE events ADD COLUMN slot_no TEXT")
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_dt ON events(file_dt)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_board ON events(board_name)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_mo ON events(mo)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_machine ON events(machine)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_comp ON events(component)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_reject_code ON events(reject_code)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_feeder ON events(feeder_no)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_slot ON events(slot_no)")
+
     conn.commit()
 
 def sha256_bytes(b: bytes) -> str:
@@ -288,6 +304,7 @@ def get_bom_lookup(conn: sqlite3.Connection, selected_bom_ids: list[int] | None)
 # INGEST LOGS
 # =========================================================
 def ingest_logs(conn: sqlite3.Connection, uploads):
+    # Always use latest-per-component for ingestion; analysis can use selected BOM versions
     bom_lookup = get_bom_lookup(conn, selected_bom_ids=None)
 
     skipped = []
@@ -333,8 +350,13 @@ def ingest_logs(conn: sqlite3.Connection, uploads):
                     comp = str(r["B"]).strip()
                     desc = str(r["C"]).strip()
                     loc = str(r["D"]).strip()
+                    feeder = str(r["H"]).strip()  # Column H
+                    slot = str(r["I"]).strip()    # Column I
                     cost = float(bom_lookup.get(comp, 0.0))
-                    ev_rows.append((file_hash, comp, desc, loc, board, mo, dt_iso, machine, cost, cost, code))
+
+                    ev_rows.append((
+                        file_hash, comp, desc, loc, feeder, slot, board, mo, dt_iso, machine, cost, cost, code
+                    ))
                 except Exception:
                     continue
 
@@ -342,9 +364,10 @@ def ingest_logs(conn: sqlite3.Connection, uploads):
             conn.executemany(
                 """
                 INSERT INTO events(
-                    file_hash, component, description, location, board_name, mo, file_dt, machine, unit_cost, cost, reject_code
+                    file_hash, component, description, location, feeder_no, slot_no,
+                    board_name, mo, file_dt, machine, unit_cost, cost, reject_code
                 )
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 ev_rows
             )
@@ -441,7 +464,7 @@ def machine_log_breakdown(conn, dt_start, dt_end, boards, mos, machines) -> pd.D
     return pd.read_sql_query(sql, conn, params=params)
 
 # =========================================================
-# EVENTS QUERY (includes Reject Code)
+# EVENTS QUERY (includes Reject Code + Feeder/Slot)
 # =========================================================
 def query_events(conn, dt_start, dt_end, boards, mos, machines, components, bom_lookup):
     where, params = _build_where(dt_start, dt_end, boards, mos, machines, components)
@@ -450,6 +473,8 @@ def query_events(conn, dt_start, dt_end, boards, mos, machines, components, bom_
       component AS Component,
       description AS Description,
       location AS Location,
+      feeder_no AS Feeder,
+      slot_no AS Slot,
       board_name AS Board,
       mo AS MO,
       file_dt AS FileDateTime,
@@ -475,17 +500,12 @@ def query_events(conn, dt_start, dt_end, boards, mos, machines, components, bom_
 # DERIVED VIEWS (Summary includes Reject Codes breakdown)
 # =========================================================
 def _format_reject_codes(series: pd.Series) -> str:
-    """
-    series contains reject codes (ints or NaN).
-    Returns: "5x C7, 5x C2, 10x C3" (sorted by count desc then code asc)
-    """
     s = series.dropna()
     if s.empty:
         return ""
     try:
         s = s.astype(int)
     except Exception:
-        # if weird strings exist, coerce where possible
         s = pd.to_numeric(s, errors="coerce").dropna().astype(int)
         if s.empty:
             return ""
@@ -619,13 +639,13 @@ def build_excel_report(
         _add_table(ws, "SummaryTable", f"A1:G{ws.max_row}")
     _fit_columns(ws)
 
-    # ---- Spit Events
+    # ---- Spit Events (now includes Feeder + Slot)
     ws = wb.create_sheet("Spit Events")
     for r in dataframe_to_rows(events_df, index=False, header=True):
         ws.append(r)
     if ws.max_row >= 2:
-        # Now includes RejectCode so width increases
-        _add_table(ws, "SpitEventsTable", f"A1:J{ws.max_row}")
+        # events_df columns: Component, Description, Location, Feeder, Slot, Board, MO, FileDateTime, Machine, RejectCode, UnitCost, Cost = 12 columns
+        _add_table(ws, "SpitEventsTable", f"A1:L{ws.max_row}")
     _fit_columns(ws)
 
     # ---- Pareto
@@ -701,6 +721,322 @@ def reset_database():
     except Exception as e:
         return False, str(e)
     return True, None
+
+# =========================================================
+# CHATBOT (OPTION 2: Grounded + Advisor)
+# =========================================================
+CHAT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "last_run",
+            "description": "Get the most recent datetime a board was run (based on ingested logs).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "board": {"type": "string"}
+                },
+                "required": ["board"]
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "boards_run",
+            "description": "Estimate boards run in a datetime window, using line-2 ÷3 correction. Optional filters: board, mo, machine.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "string", "description": "ISO datetime 'YYYY-MM-DD HH:MM:SS'"},
+                    "end": {"type": "string", "description": "ISO datetime 'YYYY-MM-DD HH:MM:SS'"},
+                    "board": {"type": ["string", "null"]},
+                    "mo": {"type": ["string", "null"]},
+                    "machine": {"type": ["string", "null"]},
+                },
+                "required": ["start", "end"]
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "top_offenders",
+            "description": "Top offending components by spit count or cost within a datetime window. Optional filters: board, mo, machine.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "string"},
+                    "end": {"type": "string"},
+                    "by": {"type": "string", "enum": ["count", "cost"]},
+                    "board": {"type": ["string", "null"]},
+                    "mo": {"type": ["string", "null"]},
+                    "machine": {"type": ["string", "null"]},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+                },
+                "required": ["start", "end", "by"]
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "worst_feeder_slot",
+            "description": "Worst feeder/slot combinations by count or cost within a datetime window. Optional filter: machine.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "string"},
+                    "end": {"type": "string"},
+                    "by": {"type": "string", "enum": ["count", "cost"]},
+                    "machine": {"type": ["string", "null"]},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 15},
+                },
+                "required": ["start", "end", "by"]
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reject_code_breakdown",
+            "description": "Reject code breakdown for a component within a datetime window. Optional filters: board, mo, machine.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "string"},
+                    "end": {"type": "string"},
+                    "component": {"type": "string"},
+                    "board": {"type": ["string", "null"]},
+                    "mo": {"type": ["string", "null"]},
+                    "machine": {"type": ["string", "null"]},
+                },
+                "required": ["start", "end", "component"]
+            },
+        },
+    },
+]
+
+def tool_last_run(conn, board: str):
+    df = pd.read_sql_query(
+        "SELECT MAX(file_dt) AS last_dt FROM logs WHERE board_name=?",
+        conn, params=[board]
+    )
+    return {"board": board, "last_dt": df.loc[0, "last_dt"]}
+
+def tool_boards_run(conn, start: str, end: str, board=None, mo=None, machine=None):
+    dt_start = datetime.fromisoformat(start)
+    dt_end = datetime.fromisoformat(end)
+    boards_sel = [board] if board else []
+    mos_sel = [mo] if mo else []
+    machines_sel = [machine] if machine else []
+    n = estimate_total_boards(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel)
+    return {
+        "start": start, "end": end,
+        "board": board, "mo": mo, "machine": machine,
+        "estimated_boards": float(n),
+        "line2_divisor": LINE2_DIVISOR
+    }
+
+def tool_top_offenders(conn, start: str, end: str, by: str, board=None, mo=None, machine=None, limit=10, selected_bom_ids=None):
+    dt_start = datetime.fromisoformat(start)
+    dt_end = datetime.fromisoformat(end)
+    boards_sel = [board] if board else []
+    mos_sel = [mo] if mo else []
+    machines_sel = [machine] if machine else []
+
+    bom_lookup = get_bom_lookup(conn, selected_bom_ids if selected_bom_ids else None)
+    df = query_events(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel, components=[], bom_lookup=bom_lookup)
+    if df.empty:
+        return {"rows": []}
+
+    limit = int(limit) if limit else 10
+    if by == "count":
+        out = (df.groupby("Component")
+               .size().reset_index(name="Spits")
+               .sort_values("Spits", ascending=False)
+               .head(limit))
+        return {"rows": out.to_dict(orient="records")}
+    else:
+        out = (df.groupby("Component")["Cost"]
+               .sum().reset_index(name="TotalCost")
+               .sort_values("TotalCost", ascending=False)
+               .head(limit))
+        return {"rows": out.to_dict(orient="records")}
+
+def tool_worst_feeder_slot(conn, start: str, end: str, by: str, machine=None, limit=15):
+    where = ["file_dt >= ?", "file_dt <= ?"]
+    params = [start, end]
+    if machine:
+        where.append("machine = ?")
+        params.append(machine)
+    where_sql = "WHERE " + " AND ".join(where)
+    limit = int(limit) if limit else 15
+
+    if by == "count":
+        df = pd.read_sql_query(
+            f"""
+            SELECT machine AS Machine, feeder_no AS Feeder, slot_no AS Slot,
+                   component AS Component, COUNT(*) AS Spits
+            FROM events
+            {where_sql}
+            GROUP BY machine, feeder_no, slot_no, component
+            ORDER BY Spits DESC
+            LIMIT {limit}
+            """,
+            conn, params=params
+        )
+        return {"rows": df.to_dict(orient="records")}
+    else:
+        df = pd.read_sql_query(
+            f"""
+            SELECT machine AS Machine, feeder_no AS Feeder, slot_no AS Slot,
+                   component AS Component, SUM(cost) AS TotalCost
+            FROM events
+            {where_sql}
+            GROUP BY machine, feeder_no, slot_no, component
+            ORDER BY TotalCost DESC
+            LIMIT {limit}
+            """,
+            conn, params=params
+        )
+        return {"rows": df.to_dict(orient="records")}
+
+def tool_reject_code_breakdown(conn, start: str, end: str, component: str, board=None, mo=None, machine=None):
+    where = ["file_dt >= ?", "file_dt <= ?", "component = ?"]
+    params = [start, end, component]
+    if board:
+        where.append("board_name = ?"); params.append(board)
+    if mo:
+        where.append("mo = ?"); params.append(mo)
+    if machine:
+        where.append("machine = ?"); params.append(machine)
+    where_sql = "WHERE " + " AND ".join(where)
+
+    df = pd.read_sql_query(
+        f"""
+        SELECT reject_code AS Code, COUNT(*) AS Count
+        FROM events
+        {where_sql}
+        GROUP BY reject_code
+        ORDER BY Count DESC
+        """,
+        conn, params=params
+    )
+    return {"rows": df.to_dict(orient="records")}
+
+def run_tool_by_name(conn, name: str, args: dict, selected_bom_ids=None):
+    if name == "last_run":
+        return tool_last_run(conn, **args)
+    if name == "boards_run":
+        return tool_boards_run(conn, **args)
+    if name == "top_offenders":
+        return tool_top_offenders(conn, selected_bom_ids=selected_bom_ids, **args)
+    if name == "worst_feeder_slot":
+        return tool_worst_feeder_slot(conn, **args)
+    if name == "reject_code_breakdown":
+        return tool_reject_code_breakdown(conn, **args)
+    return {"error": f"Unknown tool: {name}"}
+
+def chatbot_reply(conn, messages, default_start_iso: str, default_end_iso: str, advisor_mode: bool, selected_bom_ids=None):
+    if OpenAI is None:
+        return {"role": "assistant", "content": "The `openai` package is not installed. Add `openai` to requirements.txt and redeploy."}
+
+    api_key = st.secrets.get("OPENAI_API_KEY", None)
+    if not api_key:
+        return {"role": "assistant", "content": "OPENAI_API_KEY is not set in Streamlit Secrets. Add it there to enable the chatbot."}
+
+    client = OpenAI(api_key=api_key)
+
+    system = (
+        "You are a manufacturing analytics assistant for SMT pick-and-place log analysis.\n"
+        "CRITICAL RULES:\n"
+        "- For factual numbers/tables, always use tool outputs. Never invent values.\n"
+        "- If the user doesn't specify a date range, use the provided defaults.\n"
+        "- Write answers in two sections:\n"
+        "  1) Facts (from data) — cite time range and filters used.\n"
+        "  2) Suggestions (engineering judgement) — only if Advisor Mode is ON.\n"
+        "- Keep it concise and actionable.\n"
+    )
+
+    defaults = (
+        f"Default start: {default_start_iso}\n"
+        f"Default end: {default_end_iso}\n"
+        f"Advisor Mode: {advisor_mode}\n"
+        f"Line2 board estimation divisor: {LINE2_DIVISOR}\n"
+        "Note: Reject codes are C2..C7; feeder is column H; slot is column I.\n"
+    )
+
+    input_msgs = [{"role": "system", "content": system},
+                  {"role": "system", "content": defaults}]
+    input_msgs.extend(messages)
+
+    # Step 1: model decides tool calls
+    resp = client.responses.create(
+        model="gpt-4.1",
+        input=input_msgs,
+        tools=CHAT_TOOLS,
+        tool_choice="auto",
+    )
+
+    tool_calls = [o for o in resp.output if getattr(o, "type", None) == "function_call"]
+
+    # If no tool calls, return any text it produced (usually a clarification question)
+    if not tool_calls:
+        text_parts = []
+        for o in resp.output:
+            if getattr(o, "type", None) == "output_text":
+                text_parts.append(o.text)
+        text = "\n".join(text_parts).strip()
+        if not text:
+            text = "I couldn't determine which data query to run. Try asking about boards run, last run, top offenders, feeder/slot, or reject codes."
+        return {"role": "assistant", "content": text}
+
+    # Execute tools
+    tool_outputs = []
+    debug_calls = []
+    for call in tool_calls:
+        name = call.name
+        args = call.arguments if isinstance(call.arguments, dict) else json.loads(call.arguments)
+
+        # Fill defaults if missing
+        if "start" in args and not args["start"]:
+            args["start"] = default_start_iso
+        if "end" in args and not args["end"]:
+            args["end"] = default_end_iso
+        if "start" not in args and name != "last_run":
+            args["start"] = default_start_iso
+        if "end" not in args and name != "last_run":
+            args["end"] = default_end_iso
+
+        result = run_tool_by_name(conn, name, args, selected_bom_ids=selected_bom_ids)
+        debug_calls.append({"tool": name, "args": args, "result_preview": result if isinstance(result, dict) else {"result": str(result)[:500]}})
+
+        tool_outputs.append({
+            "type": "function_call_output",
+            "call_id": call.call_id,
+            "output": json.dumps(result, default=str),
+        })
+
+    # Step 2: model writes final answer using tool outputs
+    resp2 = client.responses.create(
+        model="gpt-4.1",
+        input=input_msgs,
+        tools=CHAT_TOOLS,
+        tool_choice="none",
+        previous_response_id=resp.id,
+        tool_outputs=tool_outputs,
+    )
+
+    text_parts = []
+    for o in resp2.output:
+        if getattr(o, "type", None) == "output_text":
+            text_parts.append(o.text)
+    text = "\n".join(text_parts).strip()
+    if not text:
+        text = "I ran the data queries but didn't get a textual response. Try again with a simpler question."
+
+    return {"role": "assistant", "content": text, "debug_calls": debug_calls}
 
 # =========================================================
 # APP UI
@@ -923,7 +1259,8 @@ view = st.selectbox(
         "Yield Loss",
         "Missing BOM Costs",
         "Board Loss %",
-        "Board Loss Components"
+        "Board Loss Components",
+        "Chatbot (AI)"
     ],
     index=0
 )
@@ -968,6 +1305,7 @@ if view == "Summary":
     st.dataframe(summary_df, use_container_width=True)
 
 elif view == "Spit Events":
+    st.caption("Includes Feeder (col H) and Slot (col I), plus RejectCode.")
     st.dataframe(events_df, use_container_width=True)
 
 elif view == "Pareto (Cost)":
@@ -993,3 +1331,56 @@ elif view == "Board Loss %":
 elif view == "Board Loss Components":
     st.dataframe(board_loss_components_df, use_container_width=True)
 
+elif view == "Chatbot (AI)":
+    st.subheader("Chatbot (Option 2: grounded answers + engineering suggestions)")
+
+    if OpenAI is None:
+        st.error("To enable the chatbot, add `openai` to requirements.txt and redeploy.")
+        st.stop()
+
+    api_key = st.secrets.get("OPENAI_API_KEY", None)
+    if not api_key:
+        st.warning('Add your key to Streamlit Secrets like:  OPENAI_API_KEY="sk-..."')
+        st.stop()
+
+    advisor_mode = st.toggle("Advisor mode (include engineering judgement)", value=True)
+    show_debug = st.toggle("Show tool calls (debug)", value=False)
+
+    default_start_iso = dt_start.isoformat(sep=" ")
+    default_end_iso = dt_end.isoformat(sep=" ")
+
+    # Chat state
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = [
+            {"role": "assistant", "content": "Ask me things like: 'What’s the top cost offender today and is it feeder-related?' or 'How many Board A did we run this week?'."}
+        ]
+
+    for m in st.session_state.chat_messages:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+
+    user_msg = st.chat_input("Ask anything about boards, rejects, feeder/slot, trends…")
+    if user_msg:
+        st.session_state.chat_messages.append({"role": "user", "content": user_msg})
+        with st.chat_message("user"):
+            st.markdown(user_msg)
+
+        # Run chatbot
+        reply = chatbot_reply(
+            conn=conn,
+            messages=st.session_state.chat_messages,
+            default_start_iso=default_start_iso,
+            default_end_iso=default_end_iso,
+            advisor_mode=advisor_mode,
+            selected_bom_ids=(selected_bom_ids if selected_bom_ids else None)
+        )
+
+        st.session_state.chat_messages.append({"role": "assistant", "content": reply.get("content", "")})
+
+        with st.chat_message("assistant"):
+            st.markdown(reply.get("content", ""))
+
+            # Optional debug: show which tools were called
+            if show_debug and reply.get("debug_calls"):
+                with st.expander("Tool calls (debug)"):
+                    st.json(reply["debug_calls"])
