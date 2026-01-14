@@ -639,12 +639,11 @@ def build_excel_report(
         _add_table(ws, "SummaryTable", f"A1:G{ws.max_row}")
     _fit_columns(ws)
 
-    # ---- Spit Events (now includes Feeder + Slot)
+    # ---- Spit Events (includes Feeder + Slot)
     ws = wb.create_sheet("Spit Events")
     for r in dataframe_to_rows(events_df, index=False, header=True):
         ws.append(r)
     if ws.max_row >= 2:
-        # events_df columns: Component, Description, Location, Feeder, Slot, Board, MO, FileDateTime, Machine, RejectCode, UnitCost, Cost = 12 columns
         _add_table(ws, "SpitEventsTable", f"A1:L{ws.max_row}")
     _fit_columns(ws)
 
@@ -723,8 +722,12 @@ def reset_database():
     return True, None
 
 # =========================================================
-# CHATBOT (OPTION 2: Grounded + Advisor)
+# CHATBOT (Option 2)
 # =========================================================
+
+# NOTE: IMPORTANT compatibility change:
+# - Do NOT use ["string","null"] union types
+# - Optional fields are simply not required
 CHAT_TOOLS = [
     {
         "type": "function",
@@ -733,10 +736,9 @@ CHAT_TOOLS = [
             "description": "Get the most recent datetime a board was run (based on ingested logs).",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "board": {"type": "string"}
-                },
-                "required": ["board"]
+                "properties": {"board": {"type": "string"}},
+                "required": ["board"],
+                "additionalProperties": False,
             },
         },
     },
@@ -744,17 +746,18 @@ CHAT_TOOLS = [
         "type": "function",
         "function": {
             "name": "boards_run",
-            "description": "Estimate boards run in a datetime window, using line-2 ÷3 correction. Optional filters: board, mo, machine.",
+            "description": "Estimate boards run in a datetime window using line-2 ÷3 correction. Optional filters: board, mo, machine.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "start": {"type": "string", "description": "ISO datetime 'YYYY-MM-DD HH:MM:SS'"},
-                    "end": {"type": "string", "description": "ISO datetime 'YYYY-MM-DD HH:MM:SS'"},
-                    "board": {"type": ["string", "null"]},
-                    "mo": {"type": ["string", "null"]},
-                    "machine": {"type": ["string", "null"]},
+                    "start": {"type": "string"},
+                    "end": {"type": "string"},
+                    "board": {"type": "string"},
+                    "mo": {"type": "string"},
+                    "machine": {"type": "string"},
                 },
-                "required": ["start", "end"]
+                "required": ["start", "end"],
+                "additionalProperties": False,
             },
         },
     },
@@ -762,19 +765,20 @@ CHAT_TOOLS = [
         "type": "function",
         "function": {
             "name": "top_offenders",
-            "description": "Top offending components by spit count or cost within a datetime window. Optional filters: board, mo, machine.",
+            "description": "Top offending components by spit count or cost in a datetime window. Optional filters: board, mo, machine.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "start": {"type": "string"},
                     "end": {"type": "string"},
                     "by": {"type": "string", "enum": ["count", "cost"]},
-                    "board": {"type": ["string", "null"]},
-                    "mo": {"type": ["string", "null"]},
-                    "machine": {"type": ["string", "null"]},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+                    "board": {"type": "string"},
+                    "mo": {"type": "string"},
+                    "machine": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50},
                 },
-                "required": ["start", "end", "by"]
+                "required": ["start", "end", "by"],
+                "additionalProperties": False,
             },
         },
     },
@@ -782,17 +786,18 @@ CHAT_TOOLS = [
         "type": "function",
         "function": {
             "name": "worst_feeder_slot",
-            "description": "Worst feeder/slot combinations by count or cost within a datetime window. Optional filter: machine.",
+            "description": "Worst feeder/slot combos by count or cost in a datetime window. Optional filter: machine.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "start": {"type": "string"},
                     "end": {"type": "string"},
                     "by": {"type": "string", "enum": ["count", "cost"]},
-                    "machine": {"type": ["string", "null"]},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 15},
+                    "machine": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50},
                 },
-                "required": ["start", "end", "by"]
+                "required": ["start", "end", "by"],
+                "additionalProperties": False,
             },
         },
     },
@@ -800,18 +805,19 @@ CHAT_TOOLS = [
         "type": "function",
         "function": {
             "name": "reject_code_breakdown",
-            "description": "Reject code breakdown for a component within a datetime window. Optional filters: board, mo, machine.",
+            "description": "Reject code breakdown for a component in a datetime window. Optional filters: board, mo, machine.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "start": {"type": "string"},
                     "end": {"type": "string"},
                     "component": {"type": "string"},
-                    "board": {"type": ["string", "null"]},
-                    "mo": {"type": ["string", "null"]},
-                    "machine": {"type": ["string", "null"]},
+                    "board": {"type": "string"},
+                    "mo": {"type": "string"},
+                    "machine": {"type": "string"},
                 },
-                "required": ["start", "end", "component"]
+                "required": ["start", "end", "component"],
+                "additionalProperties": False,
             },
         },
     },
@@ -841,6 +847,7 @@ def tool_boards_run(conn, start: str, end: str, board=None, mo=None, machine=Non
 def tool_top_offenders(conn, start: str, end: str, by: str, board=None, mo=None, machine=None, limit=10, selected_bom_ids=None):
     dt_start = datetime.fromisoformat(start)
     dt_end = datetime.fromisoformat(end)
+
     boards_sel = [board] if board else []
     mos_sel = [mo] if mo else []
     machines_sel = [machine] if machine else []
@@ -928,15 +935,71 @@ def tool_reject_code_breakdown(conn, start: str, end: str, component: str, board
 def run_tool_by_name(conn, name: str, args: dict, selected_bom_ids=None):
     if name == "last_run":
         return tool_last_run(conn, **args)
+
     if name == "boards_run":
-        return tool_boards_run(conn, **args)
+        return tool_boards_run(
+            conn,
+            start=args.get("start"),
+            end=args.get("end"),
+            board=args.get("board") or None,
+            mo=args.get("mo") or None,
+            machine=args.get("machine") or None,
+        )
+
     if name == "top_offenders":
-        return tool_top_offenders(conn, selected_bom_ids=selected_bom_ids, **args)
+        return tool_top_offenders(
+            conn,
+            start=args.get("start"),
+            end=args.get("end"),
+            by=args.get("by"),
+            board=args.get("board") or None,
+            mo=args.get("mo") or None,
+            machine=args.get("machine") or None,
+            limit=args.get("limit", 10),
+            selected_bom_ids=selected_bom_ids
+        )
+
     if name == "worst_feeder_slot":
-        return tool_worst_feeder_slot(conn, **args)
+        return tool_worst_feeder_slot(
+            conn,
+            start=args.get("start"),
+            end=args.get("end"),
+            by=args.get("by"),
+            machine=args.get("machine") or None,
+            limit=args.get("limit", 15),
+        )
+
     if name == "reject_code_breakdown":
-        return tool_reject_code_breakdown(conn, **args)
+        return tool_reject_code_breakdown(
+            conn,
+            start=args.get("start"),
+            end=args.get("end"),
+            component=args.get("component"),
+            board=args.get("board") or None,
+            mo=args.get("mo") or None,
+            machine=args.get("machine") or None,
+        )
+
     return {"error": f"Unknown tool: {name}"}
+
+def _extract_function_calls(resp):
+    """
+    Compatible extractor for openai-python 1.x Responses API.
+    """
+    calls = []
+    if hasattr(resp, "output") and resp.output:
+        for o in resp.output:
+            if getattr(o, "type", None) == "function_call":
+                calls.append(o)
+    return calls
+
+def _extract_text(resp):
+    parts = []
+    if hasattr(resp, "output") and resp.output:
+        for o in resp.output:
+            if getattr(o, "type", None) == "output_text":
+                parts.append(o.text)
+    return "\n".join(parts).strip()
 
 def chatbot_reply(conn, messages, default_start_iso: str, default_end_iso: str, advisor_mode: bool, selected_bom_ids=None):
     if OpenAI is None:
@@ -957,6 +1020,7 @@ def chatbot_reply(conn, messages, default_start_iso: str, default_end_iso: str, 
         "  1) Facts (from data) — cite time range and filters used.\n"
         "  2) Suggestions (engineering judgement) — only if Advisor Mode is ON.\n"
         "- Keep it concise and actionable.\n"
+        "- If user asks for 'today', 'yesterday', 'this week', interpret relative to defaults.\n"
     )
 
     defaults = (
@@ -964,14 +1028,14 @@ def chatbot_reply(conn, messages, default_start_iso: str, default_end_iso: str, 
         f"Default end: {default_end_iso}\n"
         f"Advisor Mode: {advisor_mode}\n"
         f"Line2 board estimation divisor: {LINE2_DIVISOR}\n"
-        "Note: Reject codes are C2..C7; feeder is column H; slot is column I.\n"
+        "Reject codes are C2..C7. Feeder is column H and Slot is column I.\n"
     )
 
     input_msgs = [{"role": "system", "content": system},
                   {"role": "system", "content": defaults}]
     input_msgs.extend(messages)
 
-    # Step 1: model decides tool calls
+    # ---- Call 1: get tool calls
     resp = client.responses.create(
         model="gpt-4.1",
         input=input_msgs,
@@ -979,38 +1043,37 @@ def chatbot_reply(conn, messages, default_start_iso: str, default_end_iso: str, 
         tool_choice="auto",
     )
 
-    tool_calls = [o for o in resp.output if getattr(o, "type", None) == "function_call"]
+    tool_calls = _extract_function_calls(resp)
 
-    # If no tool calls, return any text it produced (usually a clarification question)
+    # If no tool calls, return any text it produced (clarification question etc.)
     if not tool_calls:
-        text_parts = []
-        for o in resp.output:
-            if getattr(o, "type", None) == "output_text":
-                text_parts.append(o.text)
-        text = "\n".join(text_parts).strip()
+        text = _extract_text(resp)
         if not text:
-            text = "I couldn't determine which data query to run. Try asking about boards run, last run, top offenders, feeder/slot, or reject codes."
+            text = "I couldn't decide which query to run. Try asking about boards run, last run, top offenders, feeder/slot, or reject codes."
         return {"role": "assistant", "content": text}
 
-    # Execute tools
+    # ---- Execute tool calls
     tool_outputs = []
     debug_calls = []
+
     for call in tool_calls:
         name = call.name
         args = call.arguments if isinstance(call.arguments, dict) else json.loads(call.arguments)
 
-        # Fill defaults if missing
-        if "start" in args and not args["start"]:
-            args["start"] = default_start_iso
-        if "end" in args and not args["end"]:
-            args["end"] = default_end_iso
-        if "start" not in args and name != "last_run":
-            args["start"] = default_start_iso
-        if "end" not in args and name != "last_run":
-            args["end"] = default_end_iso
+        # Fill defaults for missing start/end in Python (safer than expecting model)
+        if name != "last_run":
+            if not args.get("start"):
+                args["start"] = default_start_iso
+            if not args.get("end"):
+                args["end"] = default_end_iso
 
         result = run_tool_by_name(conn, name, args, selected_bom_ids=selected_bom_ids)
-        debug_calls.append({"tool": name, "args": args, "result_preview": result if isinstance(result, dict) else {"result": str(result)[:500]}})
+
+        debug_calls.append({
+            "tool": name,
+            "args": args,
+            "result_preview": (result if isinstance(result, dict) else {"result": str(result)[:500]})
+        })
 
         tool_outputs.append({
             "type": "function_call_output",
@@ -1018,23 +1081,19 @@ def chatbot_reply(conn, messages, default_start_iso: str, default_end_iso: str, 
             "output": json.dumps(result, default=str),
         })
 
-    # Step 2: model writes final answer using tool outputs
+    # ---- Call 2: final answer using tool outputs
     resp2 = client.responses.create(
         model="gpt-4.1",
         input=input_msgs,
         tools=CHAT_TOOLS,
-        tool_choice="none",
+        tool_choice="auto",
         previous_response_id=resp.id,
         tool_outputs=tool_outputs,
     )
 
-    text_parts = []
-    for o in resp2.output:
-        if getattr(o, "type", None) == "output_text":
-            text_parts.append(o.text)
-    text = "\n".join(text_parts).strip()
+    text = _extract_text(resp2)
     if not text:
-        text = "I ran the data queries but didn't get a textual response. Try again with a simpler question."
+        text = "I ran the data queries but didn't get a textual response. Try asking a simpler question."
 
     return {"role": "assistant", "content": text, "debug_calls": debug_calls}
 
@@ -1352,7 +1411,7 @@ elif view == "Chatbot (AI)":
     # Chat state
     if "chat_messages" not in st.session_state:
         st.session_state.chat_messages = [
-            {"role": "assistant", "content": "Ask me things like: 'What’s the top cost offender today and is it feeder-related?' or 'How many Board A did we run this week?'."}
+            {"role": "assistant", "content": "Ask me: 'Top cost offender today?', 'Worst feeder/slot?', 'How many Board A ran this week?', 'Reject code breakdown for CP20-2137'."}
         ]
 
     for m in st.session_state.chat_messages:
@@ -1365,7 +1424,6 @@ elif view == "Chatbot (AI)":
         with st.chat_message("user"):
             st.markdown(user_msg)
 
-        # Run chatbot
         reply = chatbot_reply(
             conn=conn,
             messages=st.session_state.chat_messages,
@@ -1380,7 +1438,6 @@ elif view == "Chatbot (AI)":
         with st.chat_message("assistant"):
             st.markdown(reply.get("content", ""))
 
-            # Optional debug: show which tools were called
             if show_debug and reply.get("debug_calls"):
                 with st.expander("Tool calls (debug)"):
                     st.json(reply["debug_calls"])
