@@ -3,4 +3,4 @@ pandas
 numpy
 openpyxl
 matplotlib
-openai
+openai>=1.40.0
