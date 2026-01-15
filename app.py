@@ -1037,7 +1037,7 @@ def chatbot_reply(conn, messages, default_start_iso: str, default_end_iso: str, 
 
     # ---- Call 1: get tool calls
     resp = client.responses.create(
-        model="gpt-4.1",
+        model="gpt-4.1-mini",
         input=input_msgs,
         tools=CHAT_TOOLS,
         tool_choice="auto",
@@ -1083,7 +1083,7 @@ def chatbot_reply(conn, messages, default_start_iso: str, default_end_iso: str, 
 
     # ---- Call 2: final answer using tool outputs
     resp2 = client.responses.create(
-        model="gpt-4.1",
+        model="gpt-4.1-mini",
         input=input_msgs,
         tools=CHAT_TOOLS,
         tool_choice="auto",
@@ -1441,3 +1441,4 @@ elif view == "Chatbot (AI)":
             if show_debug and reply.get("debug_calls"):
                 with st.expander("Tool calls (debug)"):
                     st.json(reply["debug_calls"])
+
