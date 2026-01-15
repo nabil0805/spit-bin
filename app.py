@@ -497,7 +497,7 @@ def query_events(conn, dt_start, dt_end, boards, mos, machines, components, bom_
     return df
 
 # =========================================================
-# DERIVED VIEWS (Summary includes Reject Codes breakdown)
+# DERIVED VIEWS
 # =========================================================
 def _format_reject_codes(series: pd.Series) -> str:
     s = series.dropna()
@@ -722,12 +722,12 @@ def reset_database():
     return True, None
 
 # =========================================================
-# CHATBOT (Option 2)
+# CHATBOT (Option 2) — Robust + Model Fallback + No-Tools Fallback
 # =========================================================
 
-# NOTE: IMPORTANT compatibility change:
-# - Do NOT use ["string","null"] union types
-# - Optional fields are simply not required
+# Important compatibility choice:
+# - Avoid ["string","null"] union types.
+# - Optional fields are simply not required.
 CHAT_TOOLS = [
     {
         "type": "function",
@@ -822,6 +822,22 @@ CHAT_TOOLS = [
         },
     },
 ]
+
+def _extract_function_calls(resp):
+    calls = []
+    if hasattr(resp, "output") and resp.output:
+        for o in resp.output:
+            if getattr(o, "type", None) == "function_call":
+                calls.append(o)
+    return calls
+
+def _extract_text(resp):
+    parts = []
+    if hasattr(resp, "output") and resp.output:
+        for o in resp.output:
+            if getattr(o, "type", None) == "output_text":
+                parts.append(o.text)
+    return "\n".join(parts).strip()
 
 def tool_last_run(conn, board: str):
     df = pd.read_sql_query(
@@ -982,26 +998,21 @@ def run_tool_by_name(conn, name: str, args: dict, selected_bom_ids=None):
 
     return {"error": f"Unknown tool: {name}"}
 
-def _extract_function_calls(resp):
+def chatbot_reply(
+    conn,
+    messages,
+    default_start_iso: str,
+    default_end_iso: str,
+    advisor_mode: bool,
+    selected_bom_ids=None
+):
     """
-    Compatible extractor for openai-python 1.x Responses API.
+    Returns dict with:
+      - content (assistant text)
+      - model_used
+      - debug_calls (optional)
+      - internal_error (optional)
     """
-    calls = []
-    if hasattr(resp, "output") and resp.output:
-        for o in resp.output:
-            if getattr(o, "type", None) == "function_call":
-                calls.append(o)
-    return calls
-
-def _extract_text(resp):
-    parts = []
-    if hasattr(resp, "output") and resp.output:
-        for o in resp.output:
-            if getattr(o, "type", None) == "output_text":
-                parts.append(o.text)
-    return "\n".join(parts).strip()
-
-def chatbot_reply(conn, messages, default_start_iso: str, default_end_iso: str, advisor_mode: bool, selected_bom_ids=None):
     if OpenAI is None:
         return {"role": "assistant", "content": "The `openai` package is not installed. Add `openai` to requirements.txt and redeploy."}
 
@@ -1020,7 +1031,6 @@ def chatbot_reply(conn, messages, default_start_iso: str, default_end_iso: str, 
         "  1) Facts (from data) — cite time range and filters used.\n"
         "  2) Suggestions (engineering judgement) — only if Advisor Mode is ON.\n"
         "- Keep it concise and actionable.\n"
-        "- If user asks for 'today', 'yesterday', 'this week', interpret relative to defaults.\n"
     )
 
     defaults = (
@@ -1035,67 +1045,120 @@ def chatbot_reply(conn, messages, default_start_iso: str, default_end_iso: str, 
                   {"role": "system", "content": defaults}]
     input_msgs.extend(messages)
 
-    # ---- Call 1: get tool calls
-    resp = client.responses.create(
-        model="gpt-4.1-mini",
-        input=input_msgs,
-        tools=CHAT_TOOLS,
-        tool_choice="auto",
-    )
+    # Try these models in order (4o-mini tends to be enabled widely)
+    model_candidates = ["gpt-4.1", "gpt-4.1-mini", "gpt-4o-mini"]
 
-    tool_calls = _extract_function_calls(resp)
+    last_err = None
 
-    # If no tool calls, return any text it produced (clarification question etc.)
-    if not tool_calls:
-        text = _extract_text(resp)
+    # ---- Try tool-calling flow
+    for model_name in model_candidates:
+        try:
+            resp = client.responses.create(
+                model=model_name,
+                input=input_msgs,
+                tools=CHAT_TOOLS,
+                tool_choice="auto",
+            )
+
+            tool_calls = _extract_function_calls(resp)
+            if not tool_calls:
+                text = _extract_text(resp)
+                if not text:
+                    text = "I couldn't determine which data query to run. Try asking about boards run, last run, top offenders, feeder/slot, or reject codes."
+                return {"role": "assistant", "content": text, "model_used": model_name}
+
+            tool_outputs = []
+            debug_calls = []
+
+            for call in tool_calls:
+                name = call.name
+                args = call.arguments if isinstance(call.arguments, dict) else json.loads(call.arguments)
+
+                if name != "last_run":
+                    if not args.get("start"):
+                        args["start"] = default_start_iso
+                    if not args.get("end"):
+                        args["end"] = default_end_iso
+
+                result = run_tool_by_name(conn, name, args, selected_bom_ids=selected_bom_ids)
+
+                debug_calls.append({
+                    "tool": name,
+                    "args": args,
+                    "result_preview": result
+                })
+
+                tool_outputs.append({
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": json.dumps(result, default=str),
+                })
+
+            resp2 = client.responses.create(
+                model=model_name,
+                input=input_msgs,
+                tools=CHAT_TOOLS,
+                tool_choice="auto",
+                previous_response_id=resp.id,
+                tool_outputs=tool_outputs,
+            )
+
+            text = _extract_text(resp2)
+            if not text:
+                text = "I ran the data queries but didn't get a textual response. Try asking a simpler question."
+
+            return {
+                "role": "assistant",
+                "content": text,
+                "debug_calls": debug_calls,
+                "model_used": model_name
+            }
+
+        except Exception as e:
+            last_err = e
+
+    # ---- Tool calling failed on all models
+    err_txt = str(last_err) if last_err else "Unknown error"
+
+    # ---- No-tools fallback: NEVER hallucinate numbers, only explain how to use dashboards
+    try:
+        resp = client.responses.create(
+            model="gpt-4o-mini",
+            input=input_msgs + [{
+                "role": "system",
+                "content": (
+                    "Tool calling is unavailable. You must NOT make up any numbers. "
+                    "Instead, tell the user exactly which dashboard view(s) to open and which filters to set "
+                    "to answer their question."
+                )
+            }],
+        )
+        text = _extract_text(resp).strip()
         if not text:
-            text = "I couldn't decide which query to run. Try asking about boards run, last run, top offenders, feeder/slot, or reject codes."
-        return {"role": "assistant", "content": text}
+            text = "Tool calling is currently unavailable. Use the dashboard filters and open Summary / Pareto / Spit Events views to answer your question."
 
-    # ---- Execute tool calls
-    tool_outputs = []
-    debug_calls = []
+        return {
+            "role": "assistant",
+            "content": text,
+            "model_used": "gpt-4o-mini (no-tools fallback)",
+            "internal_error": err_txt
+        }
 
-    for call in tool_calls:
-        name = call.name
-        args = call.arguments if isinstance(call.arguments, dict) else json.loads(call.arguments)
-
-        # Fill defaults for missing start/end in Python (safer than expecting model)
-        if name != "last_run":
-            if not args.get("start"):
-                args["start"] = default_start_iso
-            if not args.get("end"):
-                args["end"] = default_end_iso
-
-        result = run_tool_by_name(conn, name, args, selected_bom_ids=selected_bom_ids)
-
-        debug_calls.append({
-            "tool": name,
-            "args": args,
-            "result_preview": (result if isinstance(result, dict) else {"result": str(result)[:500]})
-        })
-
-        tool_outputs.append({
-            "type": "function_call_output",
-            "call_id": call.call_id,
-            "output": json.dumps(result, default=str),
-        })
-
-    # ---- Call 2: final answer using tool outputs
-    resp2 = client.responses.create(
-        model="gpt-4.1-mini",
-        input=input_msgs,
-        tools=CHAT_TOOLS,
-        tool_choice="auto",
-        previous_response_id=resp.id,
-        tool_outputs=tool_outputs,
-    )
-
-    text = _extract_text(resp2)
-    if not text:
-        text = "I ran the data queries but didn't get a textual response. Try asking a simpler question."
-
-    return {"role": "assistant", "content": text, "debug_calls": debug_calls}
+    except Exception as e2:
+        return {
+            "role": "assistant",
+            "content": (
+                "Chatbot error: tool calling failed and fallback also failed.\n\n"
+                f"Tool error: {err_txt}\n"
+                f"Fallback error: {str(e2)}\n\n"
+                "Most common causes:\n"
+                "- Model not enabled for your API key\n"
+                "- Tools/function calling not enabled/allowed on your org\n"
+                "- Wrong OpenAI library version\n"
+            ),
+            "model_used": "error",
+            "internal_error": err_txt
+        }
 
 # =========================================================
 # APP UI
@@ -1403,7 +1466,7 @@ elif view == "Chatbot (AI)":
         st.stop()
 
     advisor_mode = st.toggle("Advisor mode (include engineering judgement)", value=True)
-    show_debug = st.toggle("Show tool calls (debug)", value=False)
+    show_debug = st.toggle("Show tool calls / errors (debug)", value=False)
 
     default_start_iso = dt_start.isoformat(sep=" ")
     default_end_iso = dt_end.isoformat(sep=" ")
@@ -1438,7 +1501,14 @@ elif view == "Chatbot (AI)":
         with st.chat_message("assistant"):
             st.markdown(reply.get("content", ""))
 
-            if show_debug and reply.get("debug_calls"):
-                with st.expander("Tool calls (debug)"):
-                    st.json(reply["debug_calls"])
+            # Debug only when user wants it
+            if show_debug:
+                if reply.get("model_used"):
+                    st.caption(f"Model used: {reply['model_used']}")
+                if reply.get("debug_calls"):
+                    with st.expander("Tool calls (debug)"):
+                        st.json(reply["debug_calls"])
+                if reply.get("internal_error"):
+                    with st.expander("OpenAI error (debug)"):
+                        st.code(reply["internal_error"])
 
