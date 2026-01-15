@@ -1388,4 +1388,3 @@ elif view == "Chatbot (AI)":
                 if reply.get("internal_error"):
                     with st.expander("Error"):
                         st.code(reply["internal_error"])
-
