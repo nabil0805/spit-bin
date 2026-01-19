@@ -1338,7 +1338,7 @@ if run_query:
 
 # View selector
 view = st.selectbox(
-    "Select View",
+    "C6 and C7 won't be in the bin - C2: Failed vision before electrical, C3: Failed vision after electrical, C4: Failed electrical test, C5: component lost, C6: not picked up by machine, C7: Failed vision before pickup ",
     [
         "Summary",
         "Spit Events",
@@ -1475,3 +1475,4 @@ elif view == "Chatbot (AI)":
                 if reply.get("internal_error"):
                     with st.expander("OpenAI error (debug)"):
                         st.code(reply["internal_error"])
+
