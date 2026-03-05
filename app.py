@@ -515,60 +515,36 @@ def _format_reject_codes(series: pd.Series) -> str:
         parts.append(f"{int(cnt)}x C{int(code)}")
     return ", ".join(parts)
 
-def make_summary(events_df):
+def make_summary(events_df, placement_cost):
     if events_df.empty:
         return pd.DataFrame(columns=[
-            "Component",
-            "Description",
-            "Machine",
-            "Spits",
-            "Reject Codes",
-            "UnitCost",
-            "TotalCost",
-            "TotalPlacementCost",
-            "%PlacementValue"
+            "Component","Description","Machine","Spits",
+            "Reject Codes","UnitCost","TotalCost",
+            "TotalPlacementCost","%PlacementValue"
         ])
 
     summary = (
         events_df.groupby("Component")
         .agg(
-            Description=("Description",
-                         lambda x: x.mode().iloc[0] if len(x.mode()) else x.iloc[0]),
-            Machine=("Machine",
-                     lambda x: x.mode().iloc[0] if len(x.mode()) else x.iloc[0]),
-            Spits=("Component", "count"),
+            Description=("Description", lambda x: x.mode().iloc[0] if len(x.mode()) else x.iloc[0]),
+            Machine=("Machine", lambda x: x.mode().iloc[0] if len(x.mode()) else x.iloc[0]),
+            Spits=("Component","count"),
             RejectCodes=("RejectCode", _format_reject_codes),
-            UnitCost=("UnitCost", "max"),
-            TotalCost=("Cost", "sum"),
+            UnitCost=("UnitCost","max"),
+            TotalCost=("Cost","sum"),
         )
         .reset_index()
-        .rename(columns={"RejectCodes": "Reject Codes"})
+        .rename(columns={"RejectCodes":"Reject Codes"})
     )
 
-    # ----------------------------------------------------------
-    # NEW: TOTAL PLACEMENT COST (successful parts only)
-    # ----------------------------------------------------------
-    success = events_df[events_df["RejectCode"].isna() | (events_df["RejectCode"] == 0)]
-
-    success_cost = (
-        success.groupby("Board")["UnitCost"].sum()
-        if not success.empty else pd.Series()
-    )
-
-    # map board-level placement cost back to each row
-    events_df["PlacementCost"] = events_df["Board"].map(success_cost).fillna(0.0)
-
-    summary["TotalPlacementCost"] = (
-        events_df.groupby("Component")["PlacementCost"].sum().values
-        if not events_df.empty else 0.0
-    )
-
+    # placement cost = true board value
+    summary["TotalPlacementCost"] = placement_cost
     summary["%PlacementValue"] = (
-        (summary["TotalCost"] / summary["TotalPlacementCost"]) * 100
-    ).fillna(0.0)
+        (summary["TotalCost"] / placement_cost) * 100
+    ) if placement_cost else 0.0
 
     return summary.sort_values("TotalCost", ascending=False)
-
+    
 def make_repeated_locations(events_df):
     if events_df.empty:
         return pd.DataFrame(columns=["Component","Location","Board","Machine","Spits","TotalCost"])
@@ -1339,7 +1315,14 @@ if run_query:
 
     m_breakdown = machine_log_breakdown(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel)
 
-    summary_df = make_summary(events_df)
+    # ------------------------------------------------------------
+    # NEW: placement cost = true BOM value
+    # ------------------------------------------------------------
+    placement_cost = sum(bom_lookup.values())
+
+    summary_df = make_summary(events_df, placement_cost)
+    # ------------------------------------------------------------
+
     repeated_df = make_repeated_locations(events_df)
     missing_df = make_missing_costs(events_df)
     board_loss_df = make_board_loss(events_df, board_value)
@@ -1354,6 +1337,7 @@ if run_query:
         ["Total Cost Loss", round(total_cost, 2)],
         ["Avg Cost Loss / Board", round((total_cost / total_boards_est), 2) if total_boards_est else 0.0],
         ["Board Value (input)", float(board_value)],
+        ["Total Placement Cost", round(float(placement_cost), 2)],
     ], columns=["Metric", "Value"])
 
     st.session_state.payload = {
@@ -1369,9 +1353,9 @@ if run_query:
         "total_boards_est": float(total_boards_est),
         "total_cost": float(total_cost),
         "board_value": float(board_value),
+        "placement_cost": float(placement_cost),
     }
     st.session_state.has_results = True
-
 # View selector
 view = st.selectbox(
     "C6 and C7 won't be in the bin - C2: Failed vision before electrical, C3: Failed vision after electrical, C4: Failed electrical test, C5: component lost, C6: not picked up by machine, C7: Failed vision before pickup ",
@@ -1511,4 +1495,5 @@ elif view == "Chatbot (AI)":
                 if reply.get("internal_error"):
                     with st.expander("OpenAI error (debug)"):
                         st.code(reply["internal_error"])
+
 
