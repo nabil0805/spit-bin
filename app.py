@@ -1,36 +1,31 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-import io
 import os
+import io
 import re
 from datetime import datetime
 from openai import OpenAI
 
-st.set_page_config(page_title="SMT Spit Analysis", layout="wide")
+st.set_page_config(page_title="SMT Spit Analysis",layout="wide")
 
-DB_FILE = "smt_database.db"
-
-
-# ---------------------------------------------------
-# DATABASE
-# ---------------------------------------------------
+DB="smt_logs.db"
 
 def get_conn():
-    return sqlite3.connect(DB_FILE, check_same_thread=False)
+    return sqlite3.connect(DB,check_same_thread=False)
 
+conn=get_conn()
 
 def init_db():
-
-    conn = get_conn()
-    c = conn.cursor()
+    c=conn.cursor()
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS logs(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         filename TEXT,
         board TEXT,
         mo TEXT,
-        log_time TEXT,
+        date TEXT,
         machine TEXT,
         component TEXT,
         description TEXT,
@@ -50,362 +45,307 @@ def init_db():
 
     conn.commit()
 
-
 init_db()
-
-
-# ---------------------------------------------------
-# LOG INGESTION
-# ---------------------------------------------------
 
 def ingest_logs(files):
 
-    conn = get_conn()
-    cur = conn.cursor()
+    rows=[]
 
-    rows = []
+    for f in files:
 
-    for file in files:
-
-        data = file.read()
+        data=f.read()
 
         try:
-            df = pd.read_csv(
-                io.BytesIO(data),
-                skiprows=2,
-                header=None,
-                encoding="latin-1",
-                engine="python"
-            )
+            df=pd.read_csv(io.BytesIO(data),skiprows=2,header=None,encoding="latin-1")
         except:
             continue
 
-        try:
-            board = df.iloc[0,1]
-            mo = df.iloc[0,3]
-            log_time = df.iloc[0,8]
-            machine = df.iloc[0,11]
-        except:
-            continue
+        board=df.iloc[0,1]
+        mo=df.iloc[0,3]
+        date=df.iloc[0,8]
+        machine=df.iloc[0,11]
 
-        for _, r in df.iterrows():
+        for _,r in df.iterrows():
 
-            try:
+            component=str(r[1])
+            desc=str(r[2])
+            loc=str(r[3])
+            feeder=str(r[7])
+            slot=str(r[8])
+            code=str(r[11])
 
-                component = str(r[1])
-                desc = str(r[2])
-                location = str(r[3])
-                feeder = str(r[7])
-                slot = str(r[8])
-                code = str(r[11])
+            rows.append([
+                f.name,
+                board,
+                mo,
+                date,
+                machine,
+                component,
+                desc,
+                loc,
+                feeder,
+                slot,
+                code
+            ])
 
-                rows.append([
-                    file.name,
-                    board,
-                    mo,
-                    log_time,
-                    machine,
-                    component,
-                    desc,
-                    location,
-                    feeder,
-                    slot,
-                    code
-                ])
+    c=conn.cursor()
 
-            except:
-                continue
-
-    cur.executemany("""
-    INSERT INTO logs VALUES (?,?,?,?,?,?,?,?,?,?,?)
-    """, rows)
+    c.executemany("""
+    INSERT INTO logs(
+    filename,board,mo,date,machine,
+    component,description,location,
+    feeder,slot,reject_code
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+    """,rows)
 
     conn.commit()
-
-
-# ---------------------------------------------------
-# BOM INGESTION
-# ---------------------------------------------------
 
 def ingest_bom(file):
 
-    df = pd.read_excel(file)
+    df=pd.read_excel(file)
 
-    rows = []
+    rows=[]
 
-    for _, r in df.iterrows():
+    for _,r in df.iterrows():
 
-        component = str(r[0]).strip()
+        comp=str(r[0]).strip()
+        cost=r[9]
 
-        try:
-            cost = float(r[9])
-        except:
+        if pd.isna(comp): 
             continue
 
-        rows.append((component, cost))
+        rows.append((comp,cost))
 
-    conn = get_conn()
-    cur = conn.cursor()
+    c=conn.cursor()
 
-    cur.executemany("""
-    INSERT OR REPLACE INTO bom VALUES (?,?)
-    """, rows)
+    c.executemany("""
+    INSERT OR REPLACE INTO bom(component,cost)
+    VALUES (?,?)
+    """,rows)
 
     conn.commit()
 
+def get_data():
 
-# ---------------------------------------------------
-# DATA LOADING
-# ---------------------------------------------------
+    df=pd.read_sql("SELECT * FROM logs",conn)
 
-def load_data():
+    bom=pd.read_sql("SELECT * FROM bom",conn)
 
-    conn = get_conn()
+    return df,bom
 
-    logs = pd.read_sql("SELECT * FROM logs", conn)
-    bom = pd.read_sql("SELECT * FROM bom", conn)
-
-    return logs, bom
-
-
-# ---------------------------------------------------
-# FILTERS
-# ---------------------------------------------------
-
-def apply_filters(df, board, machine, mo, start, end):
+def apply_filters(df,board,machine,mo,start,end):
 
     if board:
-        df = df[df.board == board]
+        df=df[df.board==board]
 
     if machine:
-        df = df[df.machine == machine]
+        df=df[df.machine==machine]
 
     if mo:
-        df = df[df.mo == mo]
+        df=df[df.mo==mo]
 
     if start:
-        df = df[df.log_time >= str(start)]
+        df=df[df.date>=str(start)]
 
     if end:
-        df = df[df.log_time <= str(end)]
+        df=df[df.date<=str(end)]
 
     return df
 
+def summary(df,bom):
 
-# ---------------------------------------------------
-# SUMMARY
-# ---------------------------------------------------
+    rejects=df[df.reject_code!="0"]
 
-def build_summary(df, bom):
+    grp=rejects.groupby(["component","board"]).size().reset_index(name="spits")
 
-    rejects = df[df.reject_code != "0"]
+    grp=grp.merge(bom,on="component",how="left")
 
-    summary = rejects.groupby(["component","board"]).size().reset_index(name="spits")
+    grp["total_cost"]=grp["spits"]*grp["cost"]
 
-    summary = summary.merge(bom, on="component", how="left")
+    codes=rejects.groupby(["component","board","reject_code"]).size()
 
-    summary["total_cost"] = summary["spits"] * summary["cost"]
+    code_map={}
 
-    # reject code breakdown
+    for (c,b,code),cnt in codes.items():
 
-    code_map = (
-        rejects
-        .groupby(["component","board","reject_code"])
-        .size()
-        .reset_index(name="count")
+        k=(c,b)
+
+        txt=f"{cnt}x C{code}"
+
+        code_map.setdefault(k,[]).append(txt)
+
+    grp["reject_codes"]=grp.apply(
+        lambda r:", ".join(code_map.get((r.component,r.board),[])),axis=1
     )
 
-    def code_text(comp,board):
+    placement=df[df.reject_code=="0"]
 
-        rows = code_map[
-            (code_map.component==comp) &
-            (code_map.board==board)
-        ]
+    placement=placement.merge(bom,on="component",how="left")
 
-        parts=[]
+    board_totals=placement.groupby("board")["cost"].sum()
 
-        for _,r in rows.iterrows():
-            parts.append(f"{r['count']}x C{r['reject_code']}")
+    grp["total_placement_cost"]=grp["board"].map(board_totals)
 
-        return ", ".join(parts)
+    grp["loss_percent"]=grp["total_cost"]/grp["total_placement_cost"]*100
 
-    summary["reject_codes"] = summary.apply(
-        lambda r: code_text(r.component,r.board),
-        axis=1
-    )
+    return grp
 
-    # ------------------------------------------------
-    # TOTAL PLACEMENT COST (ALL SUCCESSFUL PARTS)
-    # ------------------------------------------------
+def spit_events(df,bom):
 
-    success = df[df.reject_code=="0"]
+    rej=df[df.reject_code!="0"]
 
-    success = success.merge(bom,on="component",how="left")
+    rej=rej.merge(bom,on="component",how="left")
 
-    placement_cost = success.groupby("board")["cost"].sum()
-
-    summary["total_placement_cost"] = summary["board"].map(placement_cost)
-
-    summary["loss_percent"] = (
-        summary["total_cost"] /
-        summary["total_placement_cost"]
-    ) * 100
-
-    return summary
-
-
-# ---------------------------------------------------
-# SPIT EVENTS
-# ---------------------------------------------------
-
-def spit_events(df, bom):
-
-    rejects = df[df.reject_code!="0"]
-
-    rejects = rejects.merge(bom,on="component",how="left")
-
-    return rejects
-
-
-# ---------------------------------------------------
-# PARETO
-# ---------------------------------------------------
+    return rej
 
 def pareto(df):
 
-    rejects = df[df.reject_code!="0"]
+    p=df.groupby("component").size().reset_index(name="spits")
 
-    p = rejects.groupby("component").size().reset_index(name="spits")
-
-    p = p.sort_values("spits",ascending=False)
+    p=p.sort_values("spits",ascending=False)
 
     return p
 
-
-# ---------------------------------------------------
-# REPEATED SPITS
-# ---------------------------------------------------
-
 def repeated_spits(df):
 
-    rejects = df[df.reject_code!="0"]
+    r=df[df.reject_code!="0"]
 
-    r = (
-        rejects
-        .groupby(["board","location","component"])
-        .size()
-        .reset_index(name="count")
-    )
+    rep=r.groupby(["board","location","component"]).size()
 
-    r = r[r["count"]>1]
+    rep=rep.reset_index(name="count")
 
-    return r
+    rep=rep[rep["count"]>1]
 
+    return rep
 
-# ---------------------------------------------------
-# YIELD LOSS
-# ---------------------------------------------------
+def yield_loss(df,bom):
 
-def yield_loss(df, bom):
+    s=summary(df,bom)
 
-    s = build_summary(df,bom)
+    y=s.groupby("board")["total_cost"].sum().reset_index()
 
-    loss = s.groupby("board")["total_cost"].sum().reset_index()
+    boards=df.filename.nunique()
 
-    boards = df.filename.nunique()
-
-    machines_line2 = [
-        "IINEO682",
-        "IIN2-053-2",
-        "IIN2-053-1"
-    ]
+    machines_line2=["IINEO682","IIN2-053-2","IIN2-053-1"]
 
     if df.machine.isin(machines_line2).any():
-        boards = int(boards/3)
 
-    loss["boards_run"] = boards
+        boards=int(boards/3)
 
-    loss["loss_per_board"] = loss["total_cost"] / boards
+    y["boards_run"]=boards
 
-    return loss
+    y["loss_per_board"]=y["total_cost"]/boards
 
+    return y
 
-# ---------------------------------------------------
-# STREAMLIT UI
-# ---------------------------------------------------
+def chatbot(df):
 
-st.title("SMT Spit Analysis System")
+    key=st.text_input("OpenAI API key",type="password")
 
-logs = st.file_uploader("Upload Log Files", accept_multiple_files=True)
+    if not key:
+        return
 
-bom = st.file_uploader("Upload Master BOM")
+    client=OpenAI(api_key=key)
 
-if logs and st.button("Ingest Logs"):
-    ingest_logs(logs)
+    q=st.text_input("Ask about the data")
+
+    if not q:
+        return
+
+    data=df.to_csv(index=False)
+
+    prompt=f"""
+You are SMT manufacturing analyst.
+
+Dataset:
+
+{data}
+
+Question:
+{q}
+
+Answer clearly.
+"""
+
+    resp=client.responses.create(
+        model="gpt-4.1",
+        input=prompt
+    )
+
+    st.write(resp.output_text)
+
+st.title("SMT Spit Analysis Tool")
+
+log_files=st.file_uploader("Upload Log Files",accept_multiple_files=True)
+
+bom_file=st.file_uploader("Upload Master BOM")
+
+if log_files and st.button("Ingest Logs"):
+    ingest_logs(log_files)
     st.success("Logs ingested")
 
-if bom and st.button("Ingest BOM"):
-    ingest_bom(bom)
+if bom_file and st.button("Ingest BOM"):
+    ingest_bom(bom_file)
     st.success("BOM ingested")
 
-df, bom_df = load_data()
+df,bom=get_data()
 
 if df.empty:
     st.stop()
 
 st.sidebar.header("Filters")
 
-board = st.sidebar.selectbox("Board", [""] + sorted(df.board.unique().tolist()))
+board=st.sidebar.selectbox("Board",[""]+sorted(df.board.unique().tolist()))
 
-machine = st.sidebar.selectbox("Machine", [""] + sorted(df.machine.unique().tolist()))
+machine=st.sidebar.selectbox("Machine",[""]+sorted(df.machine.unique().tolist()))
 
-mo = st.sidebar.selectbox("MO", [""] + sorted(df.mo.unique().tolist()))
+mo=st.sidebar.selectbox("MO",[""]+sorted(df.mo.unique().tolist()))
 
-start = st.sidebar.date_input("Start Date", None)
+start=st.sidebar.date_input("Start Date",None)
 
-end = st.sidebar.date_input("End Date", None)
+end=st.sidebar.date_input("End Date",None)
 
-df = apply_filters(df, board, machine, mo, start, end)
+df=apply_filters(df,board,machine,mo,start,end)
 
-tabs = st.tabs([
+tabs=st.tabs([
 "Summary",
 "Spit Events",
 "Pareto",
 "Repeated Spits",
-"Yield Loss"
+"Yield Loss",
+"Chatbot"
 ])
-
 
 with tabs[0]:
 
-    s = build_summary(df,bom_df)
+    s=summary(df,bom)
 
     st.dataframe(s)
 
-
 with tabs[1]:
 
-    e = spit_events(df,bom_df)
+    e=spit_events(df,bom)
 
     st.dataframe(e)
 
-
 with tabs[2]:
 
-    p = pareto(df)
+    p=pareto(df)
 
     st.bar_chart(p.set_index("component"))
 
-
 with tabs[3]:
 
-    r = repeated_spits(df)
+    r=repeated_spits(df)
 
     st.dataframe(r)
 
-
 with tabs[4]:
 
-    y = yield_loss(df,bom_df)
+    y=yield_loss(df,bom)
 
     st.dataframe(y)
+
+with tabs[5]:
+
+    chatbot(df)
