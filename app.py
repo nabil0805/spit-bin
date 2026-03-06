@@ -517,7 +517,10 @@ def _format_reject_codes(series: pd.Series) -> str:
     return ", ".join(parts)
 
 
-def make_summary(events_df, conn, bom_lookup):
+def make_summary(events_df, conn, bom_lookup, dt_start=None, dt_end=None, mos_sel=None, machines_sel=None):
+
+    # Filter to only reject codes 2-7 (exclude code 0 which is successful placement)
+    events_df = events_df[events_df["RejectCode"].isin(REJECT_CODES)]
 
     if events_df.empty:
         return pd.DataFrame(columns=[
@@ -556,16 +559,37 @@ def make_summary(events_df, conn, bom_lookup):
             continue
 
         placeholders = ",".join(["?"] * len(boards))
+        params = boards.copy()
 
-        # Get ALL successfully placed components (reject_code = 0) for this board
+        # Get ALL successfully placed components (reject_code = 0) for this board, respecting selected filters
         sql = f"""
         SELECT DISTINCT component
         FROM events
         WHERE board_name IN ({placeholders})
         AND reject_code = 0
         """
+        
+        # Apply date filters
+        if dt_start is not None:
+            sql += " AND file_dt >= ?"
+            params.append(dt_start.isoformat(sep=" "))
+        if dt_end is not None:
+            sql += " AND file_dt <= ?"
+            params.append(dt_end.isoformat(sep=" "))
+        
+        # Apply machine filters
+        if machines_sel:
+            machine_placeholders = ",".join(["?"] * len(machines_sel))
+            sql += f" AND machine IN ({machine_placeholders})"
+            params.extend(machines_sel)
+        
+        # Apply MO filters
+        if mos_sel:
+            mo_placeholders = ",".join(["?"] * len(mos_sel))
+            sql += f" AND mo IN ({mo_placeholders})"
+            params.extend(mos_sel)
 
-        df = pd.read_sql_query(sql, conn, params=boards)
+        df = pd.read_sql_query(sql, conn, params=params)
 
         total = 0.0
         for comp in df["component"]:
@@ -588,59 +612,6 @@ def make_summary(events_df, conn, bom_lookup):
     summary = summary.sort_values("TotalCost", ascending=False)
 
     return summary
-
-    summary = (
-        events_df.groupby("Component")
-        .agg(
-            Description=("Description", lambda x: x.mode().iloc[0] if len(x.mode()) else x.iloc[0]),
-            Machine=("Machine", lambda x: x.mode().iloc[0] if len(x.mode()) else x.iloc[0]),
-            Board=("Board", lambda x: x.mode().iloc[0] if len(x.mode()) else x.iloc[0]),
-            Spits=("Component", "count"),
-            RejectCodes=("RejectCode", _format_reject_codes),
-            UnitCost=("UnitCost", "max"),
-            TotalCost=("Cost", "sum"),
-        )
-        .reset_index()
-        .rename(columns={"RejectCodes": "Reject Codes"})
-    )
-
-    placement_costs = []
-
-    for _, row in summary.iterrows():
-
-        board = row["Board"]
-
-        sql = """
-        SELECT component
-        FROM events
-        WHERE board_name = ?
-        AND reject_code = 0
-        """
-
-        df = pd.read_sql_query(sql, conn, params=[board])
-
-        if df.empty:
-            placement_costs.append(0)
-            continue
-
-        total = 0.0
-
-        for comp in df["component"]:
-            total += float(bom_lookup.get(str(comp).strip(), 0.0))
-
-        placement_costs.append(total)
-
-    summary["TotalPlacementCost"] = placement_costs
-
-    summary["Loss % of Placement Value"] = np.where(
-        summary["TotalPlacementCost"] > 0,
-        (summary["TotalCost"] / summary["TotalPlacementCost"]) * 100,
-        np.nan
-    )
-
-    summary = summary.drop(columns=["Board"])
-
-    return summary.sort_values("TotalCost", ascending=False)
 
 def make_repeated_locations(events_df):
     if events_df.empty:
@@ -1404,6 +1375,9 @@ if run_query:
     bom_lookup = get_bom_lookup(conn, selected_bom_ids if selected_bom_ids else None)
 
     events_df = query_events(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel, components_sel, bom_lookup=bom_lookup)
+    
+    # Filter to only reject codes 2-7 (exclude code 0 which is successful placement)
+    events_df = events_df[events_df["RejectCode"].isin(REJECT_CODES)]
 
     total_boards_est = estimate_total_boards(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel)
 
@@ -1415,7 +1389,11 @@ if run_query:
     summary_df = make_summary(
         events_df,
         conn,
-        bom_lookup
+        bom_lookup,
+        dt_start=dt_start,
+        dt_end=dt_end,
+        mos_sel=mos_sel,
+        machines_sel=machines_sel
     )
 
     repeated_df = make_repeated_locations(events_df)
@@ -1589,7 +1567,3 @@ elif view == "Chatbot (AI)":
                 if reply.get("internal_error"):
                     with st.expander("OpenAI error (debug)"):
                         st.code(reply["internal_error"])
-
-
-
-
