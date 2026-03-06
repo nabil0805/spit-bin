@@ -345,7 +345,8 @@ def ingest_logs(conn: sqlite3.Connection, uploads):
             except Exception:
                 continue
 
-            if code in REJECT_CODES:
+            # Store both rejects (2-7) and successful placements (0)
+            if code in REJECT_CODES or code == 0:
                 try:
                     comp = str(r["B"]).strip()
                     desc = str(r["C"]).strip()
@@ -556,10 +557,12 @@ def make_summary(events_df, conn, bom_lookup):
 
         placeholders = ",".join(["?"] * len(boards))
 
+        # Get ALL successfully placed components (reject_code = 0) for this board
         sql = f"""
         SELECT DISTINCT component
         FROM events
         WHERE board_name IN ({placeholders})
+        AND reject_code = 0
         """
 
         df = pd.read_sql_query(sql, conn, params=boards)
@@ -1586,3 +1589,7 @@ elif view == "Chatbot (AI)":
                 if reply.get("internal_error"):
                     with st.expander("OpenAI error (debug)"):
                         st.code(reply["internal_error"])
+
+
+
+
