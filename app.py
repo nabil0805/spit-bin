@@ -1418,7 +1418,7 @@ summary_df = make_summary(
 repeated_df = make_repeated_locations(events_df)
 missing_df = make_missing_costs(events_df)
 board_loss_df = make_board_loss(events_df, board_value)
-board_loss_components_df = make_board_loss_components(events_df, board_value)
+board_loss_components_df = make_board_loss_components(events_df, boards_run_by_board, board_value)
 
 pareto_df = summary_df[["Component", "TotalCost"]].copy()
 pareto_df = pareto_df.sort_values("TotalCost", ascending=False).head(30)
@@ -1586,8 +1586,3 @@ elif view == "Chatbot (AI)":
                 if reply.get("internal_error"):
                     with st.expander("OpenAI error (debug)"):
                         st.code(reply["internal_error"])
-
-
-
-
-
