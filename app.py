@@ -517,7 +517,7 @@ def _format_reject_codes(series: pd.Series) -> str:
     return ", ".join(parts)
 
 
-def make_summary(events_df, conn, bom_lookup, dt_start=None, dt_end=None, mos_sel=None, machines_sel=None):
+def make_summary(events_df, conn, bom_lookup, dt_start=None, dt_end=None, boards_sel=None, mos_sel=None, machines_sel=None):
 
     # Filter to only reject codes 2-7 (exclude code 0 which is successful placement)
     events_df = events_df[events_df["RejectCode"].isin(REJECT_CODES)]
@@ -559,6 +559,12 @@ def make_summary(events_df, conn, bom_lookup, dt_start=None, dt_end=None, mos_se
     if dt_end is not None:
         sql += " AND file_dt <= ?"
         params.append(dt_end.isoformat(sep=" "))
+    
+    # Apply board filters
+    if boards_sel:
+        board_placeholders = ",".join(["?"] * len(boards_sel))
+        sql += f" AND board_name IN ({board_placeholders})"
+        params.extend(boards_sel)
     
     # Apply machine filters
     if machines_sel:
@@ -609,6 +615,28 @@ def make_missing_costs(events_df):
         .reset_index()
         .rename(columns={"index":"Component", "Component":"Spits (cost=0)"})
     )
+
+def make_successful_placements(events_df):
+    if events_df.empty:
+        return pd.DataFrame(columns=["Board","Component","SuccessfulCount","UnitCost","TotalCost"])
+    
+    # Filter to only code 0 (successful placements)
+    success_df = events_df[events_df["RejectCode"] == 0]
+    
+    if success_df.empty:
+        return pd.DataFrame(columns=["Board","Component","SuccessfulCount","UnitCost","TotalCost"])
+    
+    result = (
+        success_df.groupby(["Board", "Component"])
+        .agg(
+            SuccessfulCount=("Component", "count"),
+            UnitCost=("UnitCost", "max"),
+            TotalCost=("Cost", "sum")
+        )
+        .reset_index()
+    )
+    
+    return result.sort_values(["Board", "Component"], ascending=[True, True])
 
 def make_board_loss(events_df, board_value):
     if events_df.empty:
@@ -677,6 +705,7 @@ def _add_table(ws, name, ref):
 def build_excel_report(
     events_df: pd.DataFrame,
     summary_df: pd.DataFrame,
+    successful_placements_df: pd.DataFrame,
     pareto_df: pd.DataFrame,
     repeated_df: pd.DataFrame,
     yield_df: pd.DataFrame,
@@ -692,6 +721,13 @@ def build_excel_report(
         ws.append(r)
     if ws.max_row >= 2:
         _add_table(ws, "SummaryTable", f"A1:G{ws.max_row}")
+    _fit_columns(ws)
+
+    ws = wb.create_sheet("Successful Placements")
+    for r in dataframe_to_rows(successful_placements_df, index=False, header=True):
+        ws.append(r)
+    if ws.max_row >= 2 and successful_placements_df.shape[1] > 0:
+        _add_table(ws, "SuccessfulPlacementsTable", f"A1:E{ws.max_row}")
     _fit_columns(ws)
 
     ws = wb.create_sheet("Spit Events")
@@ -1350,10 +1386,13 @@ if "has_results" not in st.session_state:
 if run_query:
     bom_lookup = get_bom_lookup(conn, selected_bom_ids if selected_bom_ids else None)
 
-    events_df = query_events(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel, components_sel, bom_lookup=bom_lookup)
+    events_df_full = query_events(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel, components_sel, bom_lookup=bom_lookup)
+    
+    # Generate successful placements report (before filtering)
+    successful_placements_df = make_successful_placements(events_df_full)
     
     # Filter to only reject codes 2-7 (exclude code 0 which is successful placement)
-    events_df = events_df[events_df["RejectCode"].isin(REJECT_CODES)]
+    events_df = events_df_full[events_df_full["RejectCode"].isin(REJECT_CODES)]
 
     total_boards_est = estimate_total_boards(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel)
 
@@ -1368,6 +1407,7 @@ if run_query:
         bom_lookup,
         dt_start=dt_start,
         dt_end=dt_end,
+        boards_sel=boards_sel,
         mos_sel=mos_sel,
         machines_sel=machines_sel
     )
@@ -1391,6 +1431,7 @@ if run_query:
     st.session_state.payload = {
         "events_df": events_df,
         "summary_df": summary_df,
+        "successful_placements_df": successful_placements_df,
         "pareto_df": pareto_df,
         "repeated_df": repeated_df,
         "missing_df": missing_df,
@@ -1409,6 +1450,7 @@ view = st.selectbox(
     "C6 and C7 won't be in the bin - C2: Failed vision before electrical, C3: Failed vision after electrical, C4: Failed electrical test, C5: component lost, C6: not picked up by machine, C7: Failed vision before pickup ",
     [
         "Summary",
+        "Successful Placements",
         "Spit Events",
         "Pareto (Cost)",
         "Repeated Locations",
@@ -1428,6 +1470,7 @@ if not st.session_state.has_results:
 payload = st.session_state.payload
 events_df = payload["events_df"]
 summary_df = payload["summary_df"]
+successful_placements_df = payload["successful_placements_df"]
 pareto_df = payload["pareto_df"]
 repeated_df = payload["repeated_df"]
 missing_df = payload["missing_df"]
@@ -1441,6 +1484,7 @@ with st.expander("⬇️ Export to Excel"):
     report_bytes = build_excel_report(
         events_df=events_df,
         summary_df=summary_df,
+        successful_placements_df=successful_placements_df,
         pareto_df=pareto_df,
         repeated_df=repeated_df,
         yield_df=yield_df,
@@ -1459,6 +1503,9 @@ with st.expander("⬇️ Export to Excel"):
 # Views
 if view == "Summary":
     st.dataframe(summary_df, use_container_width=True)
+
+elif view == "Successful Placements":
+    st.dataframe(successful_placements_df, use_container_width=True)
 
 elif view == "Spit Events":
     st.caption("Includes Feeder (col H) and Slot (col I), plus RejectCode.")
@@ -1543,3 +1590,4 @@ elif view == "Chatbot (AI)":
                 if reply.get("internal_error"):
                     with st.expander("OpenAI error (debug)"):
                         st.code(reply["internal_error"])
+
