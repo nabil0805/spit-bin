@@ -543,67 +543,43 @@ def make_summary(events_df, conn, bom_lookup, dt_start=None, dt_end=None, mos_se
         .rename(columns={"RejectCodes": "Reject Codes"})
     )
 
-    boards_per_component = (
-        events_df.groupby("Component")["Board"]
-        .unique()
-        .reset_index()
-    )
+    # Calculate Total Placement Cost ONCE across ALL boards (within selected filters)
+    # This is the sum of all successful placements (reject_code = 0) in the filtered dataset
+    params = []
+    sql = """
+    SELECT SUM(cost) as total_cost
+    FROM events
+    WHERE reject_code = 0
+    """
+    
+    # Apply date filters
+    if dt_start is not None:
+        sql += " AND file_dt >= ?"
+        params.append(dt_start.isoformat(sep=" "))
+    if dt_end is not None:
+        sql += " AND file_dt <= ?"
+        params.append(dt_end.isoformat(sep=" "))
+    
+    # Apply machine filters
+    if machines_sel:
+        machine_placeholders = ",".join(["?"] * len(machines_sel))
+        sql += f" AND machine IN ({machine_placeholders})"
+        params.extend(machines_sel)
+    
+    # Apply MO filters
+    if mos_sel:
+        mo_placeholders = ",".join(["?"] * len(mos_sel))
+        sql += f" AND mo IN ({mo_placeholders})"
+        params.extend(mos_sel)
 
-    placement_costs = []
+    df = pd.read_sql_query(sql, conn, params=params)
+    
+    total_placement_cost = 0.0
+    if not df.empty and df.loc[0, "total_cost"] is not None:
+        total_placement_cost = float(df.loc[0, "total_cost"])
 
-    for _, row in boards_per_component.iterrows():
-
-        boards = list(row["Board"])
-        if not boards:
-            placement_costs.append(0.0)
-            continue
-
-        placeholders = ",".join(["?"] * len(boards))
-        params = boards.copy()
-
-        # Sum the cost of ALL successful placements (reject_code = 0) for this board, respecting selected filters
-        sql = f"""
-        SELECT SUM(cost) as total_cost
-        FROM events
-        WHERE board_name IN ({placeholders})
-        AND reject_code = 0
-        """
-        
-        # Apply date filters
-        if dt_start is not None:
-            sql += " AND file_dt >= ?"
-            params.append(dt_start.isoformat(sep=" "))
-        if dt_end is not None:
-            sql += " AND file_dt <= ?"
-            params.append(dt_end.isoformat(sep=" "))
-        
-        # Apply machine filters
-        if machines_sel:
-            machine_placeholders = ",".join(["?"] * len(machines_sel))
-            sql += f" AND machine IN ({machine_placeholders})"
-            params.extend(machines_sel)
-        
-        # Apply MO filters
-        if mos_sel:
-            mo_placeholders = ",".join(["?"] * len(mos_sel))
-            sql += f" AND mo IN ({mo_placeholders})"
-            params.extend(mos_sel)
-
-        df = pd.read_sql_query(sql, conn, params=params)
-
-        total = 0.0
-        if not df.empty and df.loc[0, "total_cost"] is not None:
-            total = float(df.loc[0, "total_cost"])
-
-        placement_costs.append(total)
-
-    boards_per_component["TotalPlacementCost"] = placement_costs
-
-    summary = summary.merge(
-        boards_per_component[["Component","TotalPlacementCost"]],
-        on="Component",
-        how="left"
-    )
+    # Apply the same Total Placement Cost to all components
+    summary["TotalPlacementCost"] = total_placement_cost
 
     summary["Loss % of Placement Value"] = (
         summary["TotalCost"] / summary["TotalPlacementCost"]
