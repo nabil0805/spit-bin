@@ -1420,32 +1420,32 @@ missing_df = make_missing_costs(events_df)
 board_loss_df = make_board_loss(events_df, board_value)
 board_loss_components_df = make_board_loss_components(events_df, board_value)
 
-    pareto_df = summary_df[["Component", "TotalCost"]].copy()
-    pareto_df = pareto_df.sort_values("TotalCost", ascending=False).head(30)
+pareto_df = summary_df[["Component", "TotalCost"]].copy()
+pareto_df = pareto_df.sort_values("TotalCost", ascending=False).head(30)
 
-    total_cost = float(events_df["Cost"].sum()) if not events_df.empty else 0.0
-    yield_df = pd.DataFrame([
-        ["Estimated Boards Run", round(float(total_boards_est), 3)],
-        ["Total Cost Loss", round(total_cost, 2)],
-        ["Avg Cost Loss / Board", round((total_cost / total_boards_est), 2) if total_boards_est else 0.0],
-        ["Board Value (input)", float(board_value)],
-    ], columns=["Metric", "Value"])
+total_cost = float(events_df["Cost"].sum()) if not events_df.empty else 0.0
+yield_df = pd.DataFrame([
+    ["Estimated Boards Run", round(float(total_boards_est), 3)],
+    ["Total Cost Loss", round(total_cost, 2)],
+    ["Avg Cost Loss / Board", round((total_cost / total_boards_est), 2) if total_boards_est else 0.0],
+    ["Board Value (input)", float(board_value)],
+], columns=["Metric", "Value"])
 
-    st.session_state.payload = {
-        "events_df": events_df,
-        "summary_df": summary_df,
-        "pareto_df": pareto_df,
-        "repeated_df": repeated_df,
-        "missing_df": missing_df,
-        "board_loss_df": board_loss_df,
-        "board_loss_components_df": board_loss_components_df,
-        "yield_df": yield_df,
-        "machine_breakdown": m_breakdown,
-        "total_boards_est": float(total_boards_est),
-        "total_cost": float(total_cost),
-        "board_value": float(board_value),
-    }
-    st.session_state.has_results = True
+st.session_state.payload = {
+    "events_df": events_df,
+    "summary_df": summary_df,
+    "pareto_df": pareto_df,
+    "repeated_df": repeated_df,
+    "missing_df": missing_df,
+    "board_loss_df": board_loss_df,
+    "board_loss_components_df": board_loss_components_df,
+    "yield_df": yield_df,
+    "machine_breakdown": m_breakdown,
+    "total_boards_est": float(total_boards_est),
+    "total_cost": float(total_cost),
+    "board_value": float(board_value),
+}
+st.session_state.has_results = True
 
 # View selector
 view = st.selectbox(
@@ -1586,6 +1586,7 @@ elif view == "Chatbot (AI)":
                 if reply.get("internal_error"):
                     with st.expander("OpenAI error (debug)"):
                         st.code(reply["internal_error"])
+
 
 
 
