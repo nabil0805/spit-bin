@@ -526,7 +526,7 @@ def make_summary(events_df, conn, bom_lookup, dt_start=None, dt_end=None, boards
         return pd.DataFrame(columns=[
             "Component","Description","Machine","Spits",
             "Reject Codes","UnitCost","TotalCost",
-            "TotalPlacementCost","Loss % of Placement Value"
+            "TotalPlacementCost","Loss % of Placement Value","cumulative percentage"
         ])
 
     summary = (
@@ -591,7 +591,8 @@ def make_summary(events_df, conn, bom_lookup, dt_start=None, dt_end=None, boards
         summary["TotalCost"] / summary["TotalPlacementCost"]
     ) * 100
 
-    summary = summary.sort_values("TotalCost", ascending=False)
+    summary = summary.sort_values("Loss % of Placement Value", ascending=True, na_position="last")
+    summary["cumulative percentage"] = summary["Loss % of Placement Value"].fillna(0.0).cumsum()
 
     return summary
 
@@ -719,8 +720,9 @@ def build_excel_report(
     ws = wb.create_sheet("Summary")
     for r in dataframe_to_rows(summary_df, index=False, header=True):
         ws.append(r)
-    if ws.max_row >= 2:
-        _add_table(ws, "SummaryTable", f"A1:G{ws.max_row}")
+    if ws.max_row >= 2 and summary_df.shape[1] > 0:
+        end_col = chr(ord("A") + summary_df.shape[1] - 1)
+        _add_table(ws, "SummaryTable", f"A1:{end_col}{ws.max_row}")
     _fit_columns(ws)
 
     ws = wb.create_sheet("Successful Placements")
@@ -1590,4 +1592,3 @@ elif view == "Chatbot (AI)":
                 if reply.get("internal_error"):
                     with st.expander("OpenAI error (debug)"):
                         st.code(reply["internal_error"])
-
