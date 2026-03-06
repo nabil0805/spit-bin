@@ -561,9 +561,9 @@ def make_summary(events_df, conn, bom_lookup, dt_start=None, dt_end=None, mos_se
         placeholders = ",".join(["?"] * len(boards))
         params = boards.copy()
 
-        # Get ALL successfully placed components (reject_code = 0) for this board, respecting selected filters
+        # Sum the cost of ALL successful placements (reject_code = 0) for this board, respecting selected filters
         sql = f"""
-        SELECT DISTINCT component
+        SELECT SUM(cost) as total_cost
         FROM events
         WHERE board_name IN ({placeholders})
         AND reject_code = 0
@@ -592,8 +592,8 @@ def make_summary(events_df, conn, bom_lookup, dt_start=None, dt_end=None, mos_se
         df = pd.read_sql_query(sql, conn, params=params)
 
         total = 0.0
-        for comp in df["component"]:
-            total += float(bom_lookup.get(str(comp).strip(), 0.0))
+        if not df.empty and df.loc[0, "total_cost"] is not None:
+            total = float(df.loc[0, "total_cost"])
 
         placement_costs.append(total)
 
