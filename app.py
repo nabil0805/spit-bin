@@ -1409,11 +1409,11 @@ if run_query:
 
     m_breakdown = machine_log_breakdown(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel)
 
- summary_df=make_summary(
-     events_df,
-     conn,
-     bom_lookup
- )
+summary_df = make_summary(
+    events_df,
+    conn,
+    bom_lookup
+)
 
     repeated_df = make_repeated_locations(events_df)
     missing_df = make_missing_costs(events_df)
@@ -1586,5 +1586,6 @@ elif view == "Chatbot (AI)":
                 if reply.get("internal_error"):
                     with st.expander("OpenAI error (debug)"):
                         st.code(reply["internal_error"])
+
 
 
