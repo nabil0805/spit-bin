@@ -515,12 +515,13 @@ def _format_reject_codes(series: pd.Series) -> str:
         parts.append(f"{int(cnt)}x C{int(code)}")
     return ", ".join(parts)
 
-def make_summary(events_df, placement_cost):
+def make_summary(events_df, conn, bom_lookup, dt_start, dt_end, boards, mos, machines):
+
     if events_df.empty:
         return pd.DataFrame(columns=[
             "Component","Description","Machine","Spits",
             "Reject Codes","UnitCost","TotalCost",
-            "TotalPlacementCost","%PlacementValue"
+            "TotalPlacementCost","Loss % of Placement Value"
         ])
 
     summary = (
@@ -528,23 +529,54 @@ def make_summary(events_df, placement_cost):
         .agg(
             Description=("Description", lambda x: x.mode().iloc[0] if len(x.mode()) else x.iloc[0]),
             Machine=("Machine", lambda x: x.mode().iloc[0] if len(x.mode()) else x.iloc[0]),
-            Spits=("Component","count"),
+            Board=("Board", lambda x: x.mode().iloc[0] if len(x.mode()) else x.iloc[0]),
+            Spits=("Component", "count"),
             RejectCodes=("RejectCode", _format_reject_codes),
-            UnitCost=("UnitCost","max"),
-            TotalCost=("Cost","sum"),
+            UnitCost=("UnitCost", "max"),
+            TotalCost=("Cost", "sum"),
         )
         .reset_index()
-        .rename(columns={"RejectCodes":"Reject Codes"})
+        .rename(columns={"RejectCodes": "Reject Codes"})
     )
 
-    # placement cost = true board value
-    summary["TotalPlacementCost"] = placement_cost
-    summary["%PlacementValue"] = (
-        (summary["TotalCost"] / placement_cost) * 100
-    ) if placement_cost else 0.0
+    placement_costs = []
+
+    for _, row in summary.iterrows():
+
+        board = row["Board"]
+
+        sql = """
+        SELECT component
+        FROM events
+        WHERE board_name = ?
+        AND reject_code = 0
+        """
+
+        df = pd.read_sql_query(sql, conn, params=[board])
+
+        if df.empty:
+            placement_costs.append(0)
+            continue
+
+        total = 0.0
+
+        for comp in df["component"]:
+            total += float(bom_lookup.get(str(comp).strip(), 0.0))
+
+        placement_costs.append(total)
+
+    summary["TotalPlacementCost"] = placement_costs
+
+    summary["Loss % of Placement Value"] = np.where(
+        summary["TotalPlacementCost"] > 0,
+        (summary["TotalCost"] / summary["TotalPlacementCost"]) * 100,
+        np.nan
+    )
+
+    summary = summary.drop(columns=["Board"])
 
     return summary.sort_values("TotalCost", ascending=False)
-    
+
 def make_repeated_locations(events_df):
     if events_df.empty:
         return pd.DataFrame(columns=["Component","Location","Board","Machine","Spits","TotalCost"])
@@ -1315,14 +1347,16 @@ if run_query:
 
     m_breakdown = machine_log_breakdown(conn, dt_start, dt_end, boards_sel, mos_sel, machines_sel)
 
-    # ------------------------------------------------------------
-    # NEW: placement cost = true BOM value
-    # ------------------------------------------------------------
-    placement_cost = sum(bom_lookup.values())
-
-    summary_df = make_summary(events_df, placement_cost)
-    # ------------------------------------------------------------
-
+    summary_df = make_summary(
+    events_df,
+    conn,
+    bom_lookup,
+    dt_start,
+    dt_end,
+    boards_sel,
+    mos_sel,
+    machines_sel
+)
     repeated_df = make_repeated_locations(events_df)
     missing_df = make_missing_costs(events_df)
     board_loss_df = make_board_loss(events_df, board_value)
@@ -1337,7 +1371,6 @@ if run_query:
         ["Total Cost Loss", round(total_cost, 2)],
         ["Avg Cost Loss / Board", round((total_cost / total_boards_est), 2) if total_boards_est else 0.0],
         ["Board Value (input)", float(board_value)],
-        ["Total Placement Cost", round(float(placement_cost), 2)],
     ], columns=["Metric", "Value"])
 
     st.session_state.payload = {
@@ -1353,9 +1386,9 @@ if run_query:
         "total_boards_est": float(total_boards_est),
         "total_cost": float(total_cost),
         "board_value": float(board_value),
-        "placement_cost": float(placement_cost),
     }
     st.session_state.has_results = True
+
 # View selector
 view = st.selectbox(
     "C6 and C7 won't be in the bin - C2: Failed vision before electrical, C3: Failed vision after electrical, C4: Failed electrical test, C5: component lost, C6: not picked up by machine, C7: Failed vision before pickup ",
