@@ -752,7 +752,8 @@ def build_excel_report(
     for r in dataframe_to_rows(successful_placements_df, index=False, header=True):
         ws.append(r)
     if ws.max_row >= 2 and successful_placements_df.shape[1] > 0:
-        _add_table(ws, "SuccessfulPlacementsTable", f"A1:E{ws.max_row}")
+        end_col = chr(ord("A") + successful_placements_df.shape[1] - 1)
+        _add_table(ws, "SuccessfulPlacementsTable", f"A1:{end_col}{ws.max_row}")
     _fit_columns(ws)
 
     ws = wb.create_sheet("Spit Events")
@@ -1415,6 +1416,48 @@ if run_query:
     
     # Generate successful placements report (before filtering)
     successful_placements_df = make_successful_placements(events_df_full)
+    
+    # Calculate Total Placement Cost and add to successful placements
+    params = []
+    sql = """
+    SELECT component, COUNT(*) AS n
+    FROM events
+    WHERE reject_code = 0
+    """
+    
+    if dt_start is not None:
+        sql += " AND file_dt >= ?"
+        params.append(dt_start.isoformat(sep=" "))
+    if dt_end is not None:
+        sql += " AND file_dt <= ?"
+        params.append(dt_end.isoformat(sep=" "))
+    
+    if boards_sel:
+        board_placeholders = ",".join(["?"] * len(boards_sel))
+        sql += f" AND board_name IN ({board_placeholders})"
+        params.extend(boards_sel)
+    
+    if machines_sel:
+        machine_placeholders = ",".join(["?"] * len(machines_sel))
+        sql += f" AND machine IN ({machine_placeholders})"
+        params.extend(machines_sel)
+    
+    if mos_sel:
+        mo_placeholders = ",".join(["?"] * len(mos_sel))
+        sql += f" AND mo IN ({mo_placeholders})"
+        params.extend(mos_sel)
+
+    sql += " GROUP BY component"
+
+    df_placement = pd.read_sql_query(sql, conn, params=params)
+    
+    total_placement_cost = 0.0
+    if not df_placement.empty:
+        df_placement["n"] = pd.to_numeric(df_placement["n"], errors="coerce").fillna(0.0)
+        df_placement["unit_cost"] = df_placement["component"].map(lambda c: float(bom_lookup.get(normalize_component(c), 0.0)))
+        total_placement_cost = float((df_placement["n"] * df_placement["unit_cost"]).sum())
+    
+    successful_placements_df["TotalPlacementCost"] = total_placement_cost
     
     # Filter to only reject codes 2-7 (exclude code 0 which is successful placement)
     events_df = events_df_full[events_df_full["RejectCode"].isin(REJECT_CODES)]
