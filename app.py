@@ -146,6 +146,25 @@ def parse_cost(v):
     except:
         return np.nan
 
+def normalize_component(v):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return ""
+    return str(v).strip().upper()
+
+def parse_reject_code(v):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return None
+    try:
+        return int(v)
+    except Exception:
+        try:
+            f = float(str(v).strip())
+            if np.isnan(f):
+                return None
+            return int(f)
+        except Exception:
+            return None
+
 def parse_dt_machine_from_filename(filename: str):
     base = os.path.basename(filename)
     m = FILENAME_RE.match(base)
@@ -240,7 +259,7 @@ def ingest_master_bom(conn: sqlite3.Connection, bom_bytes: bytes, bom_name: str)
             if pd.isna(cost):
                 continue
 
-            items.append((str(comp).strip(), float(cost)))
+            items.append((normalize_component(comp), float(cost)))
 
     if not items:
         return 0
@@ -283,7 +302,7 @@ def get_bom_lookup(conn: sqlite3.Connection, selected_bom_ids: list[int] | None)
         ON bi.component = latest.component AND bi.bom_id = latest.max_bom_id
         """
         rows = conn.execute(sql).fetchall()
-        return {r[0]: float(r[1]) for r in rows}
+        return {normalize_component(r[0]): float(r[1]) for r in rows}
 
     placeholders = ",".join(["?"] * len(selected_bom_ids))
     sql = f"""
@@ -298,7 +317,7 @@ def get_bom_lookup(conn: sqlite3.Connection, selected_bom_ids: list[int] | None)
     ON bi.component = latest.component AND bi.bom_id = latest.max_bom_id
     """
     rows = conn.execute(sql, selected_bom_ids).fetchall()
-    return {r[0]: float(r[1]) for r in rows}
+    return {normalize_component(r[0]): float(r[1]) for r in rows}
 
 # =========================================================
 # INGEST LOGS
@@ -340,9 +359,8 @@ def ingest_logs(conn: sqlite3.Connection, uploads):
 
         ev_rows = []
         for _, r in df.iterrows():
-            try:
-                code = int(r["L"])
-            except Exception:
+            code = parse_reject_code(r["L"])
+            if code is None:
                 continue
 
             # Store both rejects (2-7) and successful placements (0)
@@ -353,7 +371,7 @@ def ingest_logs(conn: sqlite3.Connection, uploads):
                     loc = str(r["D"]).strip()
                     feeder = str(r["H"]).strip()
                     slot = str(r["I"]).strip()
-                    cost = float(bom_lookup.get(comp, 0.0))
+                    cost = float(bom_lookup.get(normalize_component(comp), 0.0))
 
                     ev_rows.append((
                         file_hash, comp, desc, loc, feeder, slot, board, mo, dt_iso, machine, cost, cost, code
@@ -493,7 +511,7 @@ def query_events(conn, dt_start, dt_end, boards, mos, machines, components, bom_
         df["Cost"] = []
         return df
 
-    df["UnitCost"] = df["Component"].map(lambda c: float(bom_lookup.get(str(c).strip(), 0.0)))
+    df["UnitCost"] = df["Component"].map(lambda c: float(bom_lookup.get(normalize_component(c), 0.0)))
     df["Cost"] = df["UnitCost"]
     return df
 
@@ -1504,6 +1522,16 @@ with st.expander("⬇️ Export to Excel"):
 
 # Views
 if view == "Summary":
+    if not summary_df.empty:
+        try:
+            placement_zero = (summary_df["TotalPlacementCost"].fillna(0.0) == 0.0).all()
+            reject_cost_zero = (summary_df["TotalCost"].fillna(0.0) == 0.0).all()
+            if placement_zero:
+                st.warning("Total Placement Cost is 0. This usually means successful placements (code 0) were not ingested for this range, or BOM component names are not matching log component names.")
+            elif reject_cost_zero:
+                st.warning("All reject costs are 0. BOM component names may not match log component names (case/spacing differences).")
+        except Exception:
+            pass
     st.dataframe(summary_df, use_container_width=True)
 
 elif view == "Successful Placements":
