@@ -1537,7 +1537,8 @@ if view == "Summary":
                 st.warning("All reject costs are 0. BOM component names may not match log component names (case/spacing differences).")
         except Exception:
             pass
-    st.dataframe(summary_df, use_container_width=True)
+    summary_display_df = summary_df.drop(columns=["TotalPlacementCost"], errors="ignore")
+    st.dataframe(summary_display_df, use_container_width=True)
 
 elif view == "Successful Placements":
     st.dataframe(successful_placements_df, use_container_width=True)
