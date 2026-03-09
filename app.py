@@ -562,10 +562,11 @@ def make_summary(events_df, conn, bom_lookup, dt_start=None, dt_end=None, boards
     )
 
     # Calculate Total Placement Cost ONCE across ALL boards (within selected filters)
-    # This is the sum of all successful placements (reject_code = 0) in the filtered dataset
+    # using current BOM lookup and successful placement counts (reject_code = 0).
+    # This avoids stale/zero stored DB costs if logs were ingested before BOM upload.
     params = []
     sql = """
-    SELECT SUM(cost) as total_cost
+    SELECT component, COUNT(*) AS n
     FROM events
     WHERE reject_code = 0
     """
@@ -596,11 +597,15 @@ def make_summary(events_df, conn, bom_lookup, dt_start=None, dt_end=None, boards
         sql += f" AND mo IN ({mo_placeholders})"
         params.extend(mos_sel)
 
+    sql += " GROUP BY component"
+
     df = pd.read_sql_query(sql, conn, params=params)
     
     total_placement_cost = 0.0
-    if not df.empty and df.loc[0, "total_cost"] is not None:
-        total_placement_cost = float(df.loc[0, "total_cost"])
+    if not df.empty:
+        df["n"] = pd.to_numeric(df["n"], errors="coerce").fillna(0.0)
+        df["unit_cost"] = df["component"].map(lambda c: float(bom_lookup.get(normalize_component(c), 0.0)))
+        total_placement_cost = float((df["n"] * df["unit_cost"]).sum())
 
     # Apply the same Total Placement Cost to all components
     summary["TotalPlacementCost"] = total_placement_cost
